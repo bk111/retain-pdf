@@ -12,8 +12,8 @@ name: Build Portable (Windows)
         description: "wxyhgk/retain-pdf tag (留空 = 最新 release)"
         required: false
         default: ""
-  schedule:
-    - cron: "0 3 * * 1"   # 每周一 03:00 UTC 检查上游新版
+  # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
+  # 需要自动追新时再恢复 schedule cron
 
 permissions:
   contents: write
