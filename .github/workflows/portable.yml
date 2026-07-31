@@ -197,7 +197,8 @@ jobs:
           if (-not (Test-Path $exe)) { Get-ChildItem desktop/win | Select-Object Name; throw "portable exe not found: $exe" }
           $stage = Join-Path $env:RUNNER_TEMP "portable_stage"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item $exe $stage
+          # 稳定文件名: 客户端 tool_manager 的 bin_name 是静态字段, 不能随版本变
+          Copy-Item $exe (Join-Path $stage "RetainPDF-portable.exe")
           Copy-Item LICENSE (Join-Path $stage "LICENSE-RetainPDF.txt") -ErrorAction SilentlyContinue
           $zip = "RetainPDF-v$version-portable-win-x64.zip"
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
