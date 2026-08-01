@@ -88,32 +88,31 @@ jobs:
           # loadPersistedConfig() → applyDefaultCredentialInputs() → 刷新提交门禁。
           # 锚点/标记双守卫: 上游升级导致失配时构建大声失败, 人工重审补丁。
           $path = "frontend/src/pages/home/entry.tsx"
-          $src = Get-Content $path -Raw
+          $src = Get-Content $path -Raw -Encoding utf8
           if ($src.Contains("[lingomaster]")) { throw "patch marker already present in $path" }
           $anchor = "services.initialize();"
           $hits = [regex]::Matches($src, [regex]::Escape($anchor)).Count
           if ($hits -ne 1) { throw "anchor '$anchor' matched $hits times in $path (expect 1); upstream changed, re-review patch" }
           $insert = @'
 
+          // [lingomaster] 上游 React cutover 丢失桌面引导(bootstrapDesktop 全码库零调用):
+          // 恢复 desktop-config.json → 渲染进程的注入,否则凭据门禁恒判"未配置"、
+          // 作业提交缺 provider token。参见 fork portable.yml 的补丁步骤说明。
+          import { isDesktopMode as lmIsDesktopMode, loadPersistedConfig as lmLoadPersistedConfig } from "../../js/config/desktop-persistence.js";
+          import { applyDefaultCredentialInputs as lmApplyDefaultCredentialInputs } from "../../js/features/credentials/default-state-port.js";
 
-// [lingomaster] 上游 React cutover 丢失桌面引导(bootstrapDesktop 全码库零调用):
-// 恢复 desktop-config.json → 渲染进程的注入,否则凭据门禁恒判"未配置"、
-// 作业提交缺 provider token。参见 fork portable.yml 的补丁步骤说明。
-import { isDesktopMode as lmIsDesktopMode, loadPersistedConfig as lmLoadPersistedConfig } from "../../js/config/desktop-persistence.js";
-import { applyDefaultCredentialInputs as lmApplyDefaultCredentialInputs } from "../../js/features/credentials/default-state-port.js";
-
-if (lmIsDesktopMode()) {
-  void (async () => {
-    try {
-      const payload = await lmLoadPersistedConfig();
-      lmApplyDefaultCredentialInputs((payload && payload.browserConfig) || {});
-      (services.features as any)?.workflowFeature?.updateCredentialGate?.();
-    } catch (error) {
-      console.error("[lingomaster] desktop config bootstrap failed:", error);
-    }
-  })();
-}
-'@
+          if (lmIsDesktopMode()) {
+            void (async () => {
+              try {
+                const payload = await lmLoadPersistedConfig();
+                lmApplyDefaultCredentialInputs((payload && payload.browserConfig) || {});
+                (services.features as any)?.workflowFeature?.updateCredentialGate?.();
+              } catch (error) {
+                console.error("[lingomaster] desktop config bootstrap failed:", error);
+              }
+            })();
+          }
+          '@
           $patched = $src.Replace($anchor, $anchor + $insert)
           Set-Content -Path $path -Value $patched -Encoding utf8 -NoNewline
           Write-Host "entry.tsx patched:"
