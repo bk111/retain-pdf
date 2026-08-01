@@ -2,6 +2,12 @@
 # (retain_pdf_integration_plan.md R3; 以上游官方 release-desktop.yml 全步骤为底,
 #  构建目标 NSIS→portable, 加上游 tag 解析/幂等跳过/LICENSE 附带/fork Release 发布)
 # 安装位置: fork 仓库 .github/workflows/portable.yml
+#
+# lm_suffix (2026-08-01, R4 修正): 上游 v4.1.10 React cutover 后 bootstrapDesktop()
+# 全码库零调用 —— 桌面模式下 desktop-config.json 的凭据/运行时配置永远进不了渲染
+# 进程, 凭据门禁恒判"未配置"、作业提交缺 provider token。构建时在 React 入口恢复
+# 等价引导 (见 Apply LingoMaster integration patch 步骤), 发布 tag 带 -lm 后缀
+# (如 v4.1.10-lm1), 与纯上游构建区分; lm_suffix 留空 = 不打补丁的纯上游构建。
 
 name: Build Portable (Windows)
 
@@ -12,6 +18,10 @@ name: Build Portable (Windows)
         description: "wxyhgk/retain-pdf tag (留空 = 最新 release)"
         required: false
         default: ""
+      lm_suffix:
+        description: "集成补丁后缀 (留空 = 纯上游构建, 不打补丁)"
+        required: false
+        default: "lm1"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -34,21 +44,31 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ inputs.upstream_tag }}"
+          $suffix = "${{ inputs.lm_suffix }}".Trim()
           $h = @{ "User-Agent" = "retainpdf-portable-build" }
           if ([string]::IsNullOrWhiteSpace($tag)) {
             $tag = (Invoke-RestMethod "https://api.github.com/repos/wxyhgk/retain-pdf/releases/latest" -Headers $h).tag_name
           }
           if (-not $tag.StartsWith("v")) { throw "unexpected tag: $tag" }
           $version = $tag.TrimStart("v")
+          $releaseTag = $tag
+          $releaseVersion = $version
+          if ($suffix) {
+            $releaseTag = "$tag-$suffix"
+            $releaseVersion = "$version-$suffix"
+          }
           $skip = "false"
           try {
-            $rel = Invoke-RestMethod "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $h
+            $rel = Invoke-RestMethod "https://api.github.com/repos/${{ github.repository }}/releases/tags/$releaseTag" -Headers $h
             if ($rel.assets | Where-Object { $_.name -like "RetainPDF-*-portable-win-x64.zip" }) { $skip = "true" }
           } catch {}
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
+          "suffix=$suffix" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+          "release_version=$releaseVersion" >> $env:GITHUB_OUTPUT
           "skip=$skip" >> $env:GITHUB_OUTPUT
-          Write-Host "upstream tag=$tag version=$version skip=$skip"
+          Write-Host "upstream tag=$tag release_tag=$releaseTag version=$releaseVersion skip=$skip"
 
       - name: Checkout upstream source at tag
         if: steps.version.outputs.skip != 'true'
@@ -56,6 +76,48 @@ jobs:
         with:
           repository: wxyhgk/retain-pdf
           ref: ${{ steps.version.outputs.tag }}
+
+      - name: Apply LingoMaster integration patch (desktop bootstrap)
+        if: steps.version.outputs.skip != 'true' && steps.version.outputs.suffix != ''
+        shell: pwsh
+        run: |
+          # 上游 bug (v4.1.10 实查): React cutover 后 bootstrapDesktop() 只有定义无调用
+          # (官方桌面用户没察觉, 因为他们在设置对话框手输过一次 key, 保存路径会写
+          # localStorage 影子, 后续启动组合根从影子播种; 而外部预写 desktop-config.json
+          # 的集成场景影子恒空)。在 React 入口恢复等价引导:
+          # loadPersistedConfig() → applyDefaultCredentialInputs() → 刷新提交门禁。
+          # 锚点/标记双守卫: 上游升级导致失配时构建大声失败, 人工重审补丁。
+          $path = "frontend/src/pages/home/entry.tsx"
+          $src = Get-Content $path -Raw
+          if ($src.Contains("[lingomaster]")) { throw "patch marker already present in $path" }
+          $anchor = "services.initialize();"
+          $hits = [regex]::Matches($src, [regex]::Escape($anchor)).Count
+          if ($hits -ne 1) { throw "anchor '$anchor' matched $hits times in $path (expect 1); upstream changed, re-review patch" }
+          $insert = @'
+
+
+// [lingomaster] 上游 React cutover 丢失桌面引导(bootstrapDesktop 全码库零调用):
+// 恢复 desktop-config.json → 渲染进程的注入,否则凭据门禁恒判"未配置"、
+// 作业提交缺 provider token。参见 fork portable.yml 的补丁步骤说明。
+import { isDesktopMode as lmIsDesktopMode, loadPersistedConfig as lmLoadPersistedConfig } from "../../js/config/desktop-persistence.js";
+import { applyDefaultCredentialInputs as lmApplyDefaultCredentialInputs } from "../../js/features/credentials/default-state-port.js";
+
+if (lmIsDesktopMode()) {
+  void (async () => {
+    try {
+      const payload = await lmLoadPersistedConfig();
+      lmApplyDefaultCredentialInputs((payload && payload.browserConfig) || {});
+      (services.features as any)?.workflowFeature?.updateCredentialGate?.();
+    } catch (error) {
+      console.error("[lingomaster] desktop config bootstrap failed:", error);
+    }
+  })();
+}
+'@
+          $patched = $src.Replace($anchor, $anchor + $insert)
+          Set-Content -Path $path -Value $patched -Encoding utf8 -NoNewline
+          Write-Host "entry.tsx patched:"
+          Select-String -Path $path -Pattern "lingomaster" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
 
       - name: Setup Node.js
         if: steps.version.outputs.skip != 'true'
@@ -187,12 +249,29 @@ jobs:
           npm --prefix desktop run smoke:frontend-bundle
           python .github/scripts/validate_desktop_bundle.py --manifest desktop/app/backend/bundle-manifest.json
 
+      - name: Verify patch survived into built bundle
+        if: steps.version.outputs.skip != 'true' && steps.version.outputs.suffix != ''
+        shell: pwsh
+        run: |
+          # esbuild minify 会剥注释/重命名标识符, 用补丁里的 console.error 字符串字面量作探针;
+          # 全树搜产物 (frontend/dist 与 desktop/app 各有一份), 每份都必须含探针
+          $bundles = Get-ChildItem -Path . -Filter "app.bundle.js" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $bundles) { throw "no app.bundle.js found for patch verification" }
+          foreach ($b in $bundles) {
+            if (-not (Get-Content $b.FullName -Raw).Contains("[lingomaster] desktop config bootstrap failed")) {
+              throw "patch probe string missing in built bundle: $($b.FullName)"
+            }
+            Write-Host "patch probe found in $($b.FullName)"
+          }
+
       - name: Package portable zip (with upstream LICENSE)
         if: steps.version.outputs.skip != 'true'
         id: package
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
+          $releaseVersion = "${{ steps.version.outputs.release_version }}"
           $exe = "desktop/win/RetainPDF-Windows-$version.exe"
           if (-not (Test-Path $exe)) { Get-ChildItem desktop/win | Select-Object Name; throw "portable exe not found: $exe" }
           $stage = Join-Path $env:RUNNER_TEMP "portable_stage"
@@ -200,7 +279,7 @@ jobs:
           # 稳定文件名: 客户端 tool_manager 的 bin_name 是静态字段, 不能随版本变
           Copy-Item $exe (Join-Path $stage "RetainPDF-portable.exe")
           Copy-Item LICENSE (Join-Path $stage "LICENSE-RetainPDF.txt") -ErrorAction SilentlyContinue
-          $zip = "RetainPDF-v$version-portable-win-x64.zip"
+          $zip = "RetainPDF-v$releaseVersion-portable-win-x64.zip"
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
           $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "zip=$zip" >> $env:GITHUB_OUTPUT
@@ -210,7 +289,7 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: "RetainPDF ${{ steps.version.outputs.tag }} portable (unofficial build)"
-          body: "Unofficial portable build of wxyhgk/retain-pdf ${{ steps.version.outputs.tag }} (MIT). Built from upstream source by GitHub Actions; see workflow run for SHA256."
-          files: RetainPDF-v${{ steps.version.outputs.version }}-portable-win-x64.zip
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: "RetainPDF ${{ steps.version.outputs.release_tag }} portable (unofficial build)"
+          body: "Unofficial portable build of wxyhgk/retain-pdf ${{ steps.version.outputs.tag }} (MIT). lm_suffix=${{ steps.version.outputs.suffix }} (non-empty = LingoMaster desktop-bootstrap patch applied to frontend entry; see portable.yml patch step). Built from upstream source by GitHub Actions; see workflow run for SHA256."
+          files: RetainPDF-v${{ steps.version.outputs.release_version }}-portable-win-x64.zip
