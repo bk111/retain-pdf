@@ -28,8 +28,10 @@ name: Build Portable (Windows)
         # lm1 = portable 自解压单 exe 形态(每次启动重复解包 190MB, 已弃);
         # lm2 起 = win-unpacked 目录形态 zip(启动秒开, plan R6),
         # bin_name 契约同步改为 RetainPDF.exe —— 与客户端 TOOL_REGISTRY 同版切换;
-        # lm3 起 = 附带更新导流禁用补丁(自动检查关 + GITHUB_REPO 指 fork, plan R6.5)
-        default: "lm3"
+        # lm3 起 = 附带更新导流禁用补丁(自动检查关 + GITHUB_REPO 指 fork, plan R6.5);
+        # lm4 起 = 目标语种 env 注入补丁(session_context 默认值改读
+        # RETAIN_TARGET_LANG(_UAGE_NAME), plan R7)
+        default: "lm4"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -146,6 +148,33 @@ jobs:
           $pkg = $pkg.Replace($needle, '"homepage": "https://github.com/bk111/retain-pdf"')
           Set-Content -Path $pkgPath -Value $pkg -Encoding utf8 -NoNewline
           Write-Host "desktop/package.json homepage -> bk111/retain-pdf"
+
+          # --- 补丁3 (lm4, plan R7): 目标语种由环境变量注入 ---
+          # 上游把目标语言硬编码为简体中文(session_context 签名默认值, 全消费链
+          # 从 control context 取值已实查)。改为 import 时读 env, 由 words13 启动器
+          # 按用户选择注入 (Electron→Rust→Python 子进程链天然继承); env 缺省时
+          # 行为与上游完全一致。
+          $ctxPath = "backend/scripts/services/translation/services/context/session_context.py"
+          $ctx = Get-Content $ctxPath -Raw -Encoding utf8
+          if ($ctx.Contains("[lingomaster]")) { throw "patch marker already present in $ctxPath" }
+          $anchor3a = "from __future__ import annotations"
+          if ([regex]::Matches($ctx, [regex]::Escape($anchor3a)).Count -ne 1) { throw "anchor3a missing/dup in $ctxPath" }
+          $insert3 = @'
+          from __future__ import annotations
+
+          # [lingomaster] R7 目标语种: 启动器经环境变量注入; 缺省=上游原行为(简体中文)。
+          import os
+
+          _LM_TARGET_LANG = os.environ.get("RETAIN_TARGET_LANG", "").strip() or "zh-CN"
+          _LM_TARGET_LANGUAGE_NAME = os.environ.get("RETAIN_TARGET_LANGUAGE_NAME", "").strip() or "简体中文"
+          '@
+          $ctx = $ctx.Replace($anchor3a, $insert3.Trim())
+          $anchor3b = '    target_lang: str = "zh-CN",' + "`n" + '    target_language_name: str = "简体中文",'
+          if ([regex]::Matches($ctx, [regex]::Escape($anchor3b)).Count -ne 1) { throw "anchor3b (target defaults) missing/dup in $ctxPath" }
+          $ctx = $ctx.Replace($anchor3b, "    target_lang: str = _LM_TARGET_LANG,`n    target_language_name: str = _LM_TARGET_LANGUAGE_NAME,")
+          Set-Content -Path $ctxPath -Value $ctx -Encoding utf8 -NoNewline
+          Write-Host "session_context.py patched (target language via env)"
+          Select-String -Path $ctxPath -Pattern "RETAIN_TARGET" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
 
       - name: Setup Node.js
         if: steps.version.outputs.skip != 'true'
@@ -301,7 +330,17 @@ jobs:
             if (-not $text.Contains("bk111/retain-pdf")) {
               throw "update-redirect probe (GITHUB_REPO=bk111/retain-pdf) missing in: $($b.FullName)"
             }
-            Write-Host "both patch probes found in $($b.FullName)"
+            Write-Host "both frontend patch probes found in $($b.FullName)"
+          }
+          # 补丁3 探针: 打包进 app 的后端 python 必含目标语种 env 读取
+          $ctxCopies = Get-ChildItem -Path . -Filter "session_context.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $ctxCopies) { throw "no session_context.py found for patch verification" }
+          foreach ($c in $ctxCopies) {
+            if (-not (Get-Content $c.FullName -Raw).Contains("RETAIN_TARGET_LANGUAGE_NAME")) {
+              throw "target-language patch probe missing in: $($c.FullName)"
+            }
+            Write-Host "target-language probe found in $($c.FullName)"
           }
 
       - name: Package app-directory zip (with upstream LICENSE)
