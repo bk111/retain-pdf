@@ -8,6 +8,10 @@
 # 进程, 凭据门禁恒判"未配置"、作业提交缺 provider token。构建时在 React 入口恢复
 # 等价引导 (见 Apply LingoMaster integration patch 步骤), 发布 tag 带 -lm 后缀
 # (如 v4.1.10-lm1), 与纯上游构建区分; lm_suffix 留空 = 不打补丁的纯上游构建。
+#
+# lm2 (2026-08-02, R6): 产物从 portable 自解压单 exe 改为 win-unpacked 目录形态
+# zip —— portable 每次启动都要解包 190MB(分钟级盲等), 目录形态秒开;
+# bin_name 契约随之改 RetainPDF.exe, 必须与客户端 TOOL_REGISTRY 同版切换。
 
 name: Build Portable (Windows)
 
@@ -21,7 +25,10 @@ name: Build Portable (Windows)
       lm_suffix:
         description: "集成补丁后缀 (留空 = 纯上游构建, 不打补丁)"
         required: false
-        default: "lm1"
+        # lm1 = portable 自解压单 exe 形态(每次启动重复解包 190MB, 已弃);
+        # lm2 起 = win-unpacked 目录形态 zip(启动秒开, plan R6),
+        # bin_name 契约同步改为 RetainPDF.exe —— 与客户端 TOOL_REGISTRY 同版切换
+        default: "lm2"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -232,13 +239,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "tailwindcss oxide native binding missing after reinstall" }
           }
 
-      - name: Build Windows portable
+      - name: Build Windows app directory (win-unpacked)
         if: steps.version.outputs.skip != 'true'
         working-directory: desktop
         shell: pwsh
         env:
           RETAIN_PDF_VERSION: ${{ steps.version.outputs.version }}
-        run: npm run dist:win32
+        run: |
+          # R6 (2026-08-02): 弃 portable 自解压单 exe (上游 dist:win32), 改出目录形态 —
+          # portable 每次启动都要向临时目录解包 190MB (分钟级盲等), 目录形态启动秒开。
+          # prepare-app 与上游 dist:win32 前半段一致; --win dir 覆盖 package.json 的 portable target。
+          npm run prepare-app
+          if ($LASTEXITCODE -ne 0) { throw "prepare-app failed" }
+          npx electron-builder --win dir --x64 --config.directories.output=win
+          if ($LASTEXITCODE -ne 0) { throw "electron-builder --win dir failed" }
 
       - name: Validate desktop bundle manifest
         if: steps.version.outputs.skip != 'true'
@@ -264,22 +278,26 @@ jobs:
             Write-Host "patch probe found in $($b.FullName)"
           }
 
-      - name: Package portable zip (with upstream LICENSE)
+      - name: Package app-directory zip (with upstream LICENSE)
         if: steps.version.outputs.skip != 'true'
         id: package
         shell: pwsh
         run: |
-          $version = "${{ steps.version.outputs.version }}"
           $releaseVersion = "${{ steps.version.outputs.release_version }}"
-          $exe = "desktop/win/RetainPDF-Windows-$version.exe"
-          if (-not (Test-Path $exe)) { Get-ChildItem desktop/win | Select-Object Name; throw "portable exe not found: $exe" }
-          $stage = Join-Path $env:RUNNER_TEMP "portable_stage"
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          # 稳定文件名: 客户端 tool_manager 的 bin_name 是静态字段, 不能随版本变
-          Copy-Item $exe (Join-Path $stage "RetainPDF-portable.exe")
-          Copy-Item LICENSE (Join-Path $stage "LICENSE-RetainPDF.txt") -ErrorAction SilentlyContinue
+          $unpacked = "desktop/win/win-unpacked"
+          # 稳定入口名: 客户端 tool_manager 的 bin_name 是静态契约 (lm2 起 = RetainPDF.exe)
+          if (-not (Test-Path "$unpacked/RetainPDF.exe")) { Get-ChildItem desktop/win | Select-Object Name; throw "RetainPDF.exe not found in $unpacked" }
+          Copy-Item LICENSE (Join-Path $unpacked "LICENSE-RetainPDF.txt") -ErrorAction SilentlyContinue
+          # 长路径预算: 客户端解压到 <app>\bin\retain-pdf\, 用户机未必开 LongPathsEnabled;
+          # zip 内相对路径超 180 字符即失败, 留 ~80 字符给安装前缀
+          $rootLen = (Resolve-Path $unpacked).Path.Length + 1
+          $paths = Get-ChildItem $unpacked -Recurse -File | ForEach-Object { $_.FullName.Substring($rootLen) }
+          $longest = $paths | Sort-Object Length -Descending | Select-Object -First 5
+          Write-Host "longest relative paths:"
+          $longest | ForEach-Object { Write-Host ("  {0} chars: {1}" -f $_.Length, $_) }
+          if (($longest | Select-Object -First 1).Length -gt 180) { throw "zip relative path exceeds 180 chars budget" }
           $zip = "RetainPDF-v$releaseVersion-portable-win-x64.zip"
-          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
+          Compress-Archive -Path "$unpacked/*" -DestinationPath $zip -Force
           $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "zip=$zip" >> $env:GITHUB_OUTPUT
           Write-Host "asset=$zip sha256=$sha size=$([math]::Round((Get-Item $zip).Length/1MB,1))MB"
