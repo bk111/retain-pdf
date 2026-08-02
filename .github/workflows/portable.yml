@@ -169,9 +169,11 @@ jobs:
           _LM_TARGET_LANGUAGE_NAME = os.environ.get("RETAIN_TARGET_LANGUAGE_NAME", "").strip() or "简体中文"
           '@
           $ctx = $ctx.Replace($anchor3a, $insert3.Trim())
-          $anchor3b = '    target_lang: str = "zh-CN",' + "`n" + '    target_language_name: str = "简体中文",'
-          if ([regex]::Matches($ctx, [regex]::Escape($anchor3b)).Count -ne 1) { throw "anchor3b (target defaults) missing/dup in $ctxPath" }
-          $ctx = $ctx.Replace($anchor3b, "    target_lang: str = _LM_TARGET_LANG,`n    target_language_name: str = _LM_TARGET_LANGUAGE_NAME,")
+          # 多行锚点必须行尾无关: runner 的 checkout 工作树是 CRLF (git autocrlf),
+          # 用 [regex]::Escape(行1) + '\r?\n' + Escape(行2) 匹配
+          $pattern3b = [regex]::Escape('    target_lang: str = "zh-CN",') + '\r?\n' + [regex]::Escape('    target_language_name: str = "简体中文",')
+          if ([regex]::Matches($ctx, $pattern3b).Count -ne 1) { throw "anchor3b (target defaults) missing/dup in $ctxPath" }
+          $ctx = [regex]::Replace($ctx, $pattern3b, "    target_lang: str = _LM_TARGET_LANG,`n    target_language_name: str = _LM_TARGET_LANGUAGE_NAME,")
           Set-Content -Path $ctxPath -Value $ctx -Encoding utf8 -NoNewline
           Write-Host "session_context.py patched (target language via env)"
           Select-String -Path $ctxPath -Pattern "RETAIN_TARGET" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
