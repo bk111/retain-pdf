@@ -27,8 +27,9 @@ name: Build Portable (Windows)
         required: false
         # lm1 = portable 自解压单 exe 形态(每次启动重复解包 190MB, 已弃);
         # lm2 起 = win-unpacked 目录形态 zip(启动秒开, plan R6),
-        # bin_name 契约同步改为 RetainPDF.exe —— 与客户端 TOOL_REGISTRY 同版切换
-        default: "lm2"
+        # bin_name 契约同步改为 RetainPDF.exe —— 与客户端 TOOL_REGISTRY 同版切换;
+        # lm3 起 = 附带更新导流禁用补丁(自动检查关 + GITHUB_REPO 指 fork, plan R6.5)
+        default: "lm3"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -84,7 +85,7 @@ jobs:
           repository: wxyhgk/retain-pdf
           ref: ${{ steps.version.outputs.tag }}
 
-      - name: Apply LingoMaster integration patch (desktop bootstrap)
+      - name: Apply LingoMaster integration patches (bootstrap + update redirect)
         if: steps.version.outputs.skip != 'true' && steps.version.outputs.suffix != ''
         shell: pwsh
         run: |
@@ -121,9 +122,30 @@ jobs:
           }
           '@
           $patched = $src.Replace($anchor, $anchor + $insert)
+
+          # --- 补丁2a (lm3): 关闭上游后台自动检查更新 ---
+          # 更新分发走 LingoMaster 自己的 TOOL_SYNC/latest.json 管线; 若不禁,
+          # 上游发新版时应用会提示更新并把用户导去下载未打补丁的官方安装版。
+          $anchor2 = "const services = createHomeComposition({ appUpdateAutoCheckEnabled: true });"
+          $hits2 = [regex]::Matches($patched, [regex]::Escape($anchor2)).Count
+          if ($hits2 -ne 1) { throw "anchor2 '$anchor2' matched $hits2 times (expect 1); upstream changed, re-review patch" }
+          $patched = $patched.Replace($anchor2, "const services = createHomeComposition({ appUpdateAutoCheckEnabled: false }); // [lingomaster] 更新由 LingoMaster 工具分发管线托管")
           Set-Content -Path $path -Value $patched -Encoding utf8 -NoNewline
           Write-Host "entry.tsx patched:"
           Select-String -Path $path -Pattern "lingomaster" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
+
+          # --- 补丁2b (lm3): GITHUB_REPO 生成源改指 fork ---
+          # generate-app-version.mjs 从 desktop/package.json homepage 提取 GITHUB_REPO;
+          # 改指 fork 后, 设置页手动"检查更新"只对我们的 release 比对 (-lm 后缀与
+          # 同核心版本比较为相等 → 恒"已是最新"), 不再导流上游安装包。
+          # 顶栏 wxyhgk 项目主页链接保留 (MIT 署名礼节)。
+          $pkgPath = "desktop/package.json"
+          $pkg = Get-Content $pkgPath -Raw -Encoding utf8
+          $needle = '"homepage": "https://github.com/wxyhgk/retain-pdf"'
+          if (-not $pkg.Contains($needle)) { throw "homepage anchor missing in desktop/package.json; upstream changed, re-review patch" }
+          $pkg = $pkg.Replace($needle, '"homepage": "https://github.com/bk111/retain-pdf"')
+          Set-Content -Path $pkgPath -Value $pkg -Encoding utf8 -NoNewline
+          Write-Host "desktop/package.json homepage -> bk111/retain-pdf"
 
       - name: Setup Node.js
         if: steps.version.outputs.skip != 'true'
@@ -272,10 +294,14 @@ jobs:
             Where-Object { $_.FullName -notmatch "node_modules" }
           if (-not $bundles) { throw "no app.bundle.js found for patch verification" }
           foreach ($b in $bundles) {
-            if (-not (Get-Content $b.FullName -Raw).Contains("[lingomaster] desktop config bootstrap failed")) {
-              throw "patch probe string missing in built bundle: $($b.FullName)"
+            $text = Get-Content $b.FullName -Raw
+            if (-not $text.Contains("[lingomaster] desktop config bootstrap failed")) {
+              throw "bootstrap patch probe missing in built bundle: $($b.FullName)"
             }
-            Write-Host "patch probe found in $($b.FullName)"
+            if (-not $text.Contains("bk111/retain-pdf")) {
+              throw "update-redirect probe (GITHUB_REPO=bk111/retain-pdf) missing in: $($b.FullName)"
+            }
+            Write-Host "both patch probes found in $($b.FullName)"
           }
 
       - name: Package app-directory zip (with upstream LICENSE)
