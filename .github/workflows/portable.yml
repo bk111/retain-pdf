@@ -32,8 +32,10 @@ name: Build Portable (Windows)
         # lm4 起 = 目标语种 env 注入补丁(session_context 默认值改读
         # RETAIN_TARGET_LANG(_UAGE_NAME), plan R7);
         # lm5 起 = 余额门禁对非官方端点放行 + 同语种不改写 prompt 守卫;
-        # lm6 起 = 移除"余额未检测"最终门禁(lm5 补的分支走不到, 见补丁4b)
-        default: "lm6"
+        # lm6 起 = 移除"余额未检测"最终门禁(lm5 补的分支走不到, 见补丁4b);
+        # lm7 起 = 补回 MinerU 供应商定义(上游前端只剩 paddle, 导致 GUI 上传路径
+        #          把 provider 静默回落成 paddle 并被 Paddle 校验卡死, 见补丁6)
+        default: "lm7"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -220,6 +222,47 @@ jobs:
           Set-Content -Path $flowPath -Value $flow -Encoding utf8 -NoNewline
           Write-Host "submit-flow.ts patched (balance gate bypass + balance-unknown gate removed)"
 
+          # --- 补丁6 (lm7, plan R11): 给前端补回 MinerU 供应商定义 ---
+          # 上游 v4.1.10 前端的 OCR_PROVIDER_DEFINITIONS 里**只剩 PaddleOCR**(后端
+          # Rust 仍支持 mineru)。于是 normalizeOcrProvider("mineru") 找不到 → 静默
+          # 回落 paddle: ① 作业 payload 变成 {provider:"paddle", paddle_token:JWT}
+          # ——我方代理只镜像 MinerU, 这条 GUI 路径提交的任务根本跑不通;
+          # ② 提交前置校验拿 JWT 去验 Paddle → "Paddle Access Token 无效"卡死。
+          # (2026-08-02 实测: 之前所有成功验收都是 API 直连指定 provider=mineru,
+          #  GUI 上传路径一直是坏的。)
+          # supportsValidation:false → 校验直接返回 skipped, 不再探我方代理没有的
+          # validate-token 端点; tokenField 归位 mineru_token, 与后端契约一致。
+          $provPath = "frontend/src/js/config/providers.ts"
+          $prov = Get-Content $provPath -Raw -Encoding utf8
+          if ($prov.Contains("LingoMaster")) { throw "patch marker already present in $provPath" }
+          $anchor6a = 'export const DEFAULT_OCR_PROVIDER = "paddle";'
+          if ([regex]::Matches($prov, [regex]::Escape($anchor6a)).Count -ne 1) { throw "anchor6a missing/dup in $provPath" }
+          $prov = $prov.Replace($anchor6a, 'export const DEFAULT_OCR_PROVIDER = "mineru";')
+          $anchor6b = 'export const OCR_PROVIDER_DEFINITIONS = ['
+          if ([regex]::Matches($prov, [regex]::Escape($anchor6b)).Count -ne 1) { throw "anchor6b missing/dup in $provPath" }
+          $mineru = @'
+          export const OCR_PROVIDER_DEFINITIONS = [
+            {
+              id: "mineru",
+              label: "MinerU",
+              description: "MinerU 文档解析（LingoMaster 托管）。",
+              tokenField: "mineru_token",
+              runtimeConfigKey: "mineruToken",
+              tokenLabel: "MinerU Token",
+              tokenPlaceholder: "MinerU Token",
+              validationButtonLabel: "检测 MinerU",
+              validationIdleMessage: "未检测",
+              validationMissingMessage: "请先登录 LingoMaster。",
+              validationUnavailableMessage: "",
+              docsUrl: "",
+              docsLabel: "",
+              supportsValidation: false,
+            },
+          '@
+          $prov = $prov.Replace($anchor6b, $mineru.Trim())
+          Set-Content -Path $provPath -Value $prov -Encoding utf8 -NoNewline
+          Write-Host "providers.ts patched (MinerU provider restored, default -> mineru)"
+
           # --- 补丁5 (lm5, plan R7b): 同语种不改写 ---
           # 目标语种==原文语种时, 上游 prompt 只说"翻译成 X", 模型无事可做便改写
           # 题干甚至直接作答(2026-08-02 实测: 英文文档译成英文, Q2 题干变成答案)。
@@ -391,6 +434,10 @@ jobs:
             # 反向探针(补丁4b): 那句拦死提交的红字必须从产物里彻底消失
             if ($text.Contains("无法确认 DeepSeek 余额")) {
               throw "balance-unknown gate still present in: $($b.FullName)"
+            }
+            # 补丁6: MinerU 供应商定义必须在册(否则 provider 又被回落成 paddle)
+            if (-not $text.Contains("LingoMaster")) {
+              throw "MinerU provider definition missing in: $($b.FullName)"
             }
             Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed) in $($b.FullName)"
           }
