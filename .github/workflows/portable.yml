@@ -30,8 +30,9 @@ name: Build Portable (Windows)
         # bin_name 契约同步改为 RetainPDF.exe —— 与客户端 TOOL_REGISTRY 同版切换;
         # lm3 起 = 附带更新导流禁用补丁(自动检查关 + GITHUB_REPO 指 fork, plan R6.5);
         # lm4 起 = 目标语种 env 注入补丁(session_context 默认值改读
-        # RETAIN_TARGET_LANG(_UAGE_NAME), plan R7)
-        default: "lm4"
+        # RETAIN_TARGET_LANG(_UAGE_NAME), plan R7);
+        # lm5 起 = 余额门禁对非官方端点放行 + 同语种不改写 prompt 守卫
+        default: "lm5"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -177,6 +178,44 @@ jobs:
           Set-Content -Path $ctxPath -Value $ctx -Encoding utf8 -NoNewline
           Write-Host "session_context.py patched (target language via env)"
           Select-String -Path $ctxPath -Pattern "RETAIN_TARGET" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
+
+          # --- 补丁4 (lm5, plan R6.5b): 余额门禁对非官方端点放行 ---
+          # 上游余额查询只认 api.deepseek.com(Rust deepseek_balance_url), 我们的
+          # base_url 是自家代理 → 恒返回 unsupported_provider → "已检测"标志永远 false
+          # → 上传对话框"直接翻译"被卡死在"无法确认 DeepSeek 余额"。额度/计费由我方
+          # 服务端 credits 门禁负责, 此处不该拦。(不能伪造余额: null 会被当 0 判"不足")
+          $flowPath = "frontend/src/js/features/app-actions/submit-flow.ts"
+          $flow = Get-Content $flowPath -Raw -Encoding utf8
+          if ($flow.Contains("[lingomaster]")) { throw "patch marker already present in $flowPath" }
+          $anchor4 = '    if (result?.status === "network_error") {'
+          if ([regex]::Matches($flow, [regex]::Escape($anchor4)).Count -ne 1) { throw "anchor4 missing/dup in $flowPath" }
+          $insert4 = @'
+              if (result?.status === "unsupported_provider") {
+                // [lingomaster] 非官方 DeepSeek 端点(我方代理)没有余额接口; 额度与
+                // 计费由服务端 credits 门禁负责, 此处不拦提交。
+                setText("error-box", "");
+                return true;
+              }
+          '@
+          # 不再二次剥缩进: YAML 块标量已剥掉 10 空格, here-string 内容即为
+          # 目标缩进(if/} 4 格、函数体 6 格), 与 submit-flow.ts 周围代码一致
+          $flow = $flow.Replace($anchor4, $insert4.TrimEnd() + "`n" + $anchor4)
+          Set-Content -Path $flowPath -Value $flow -Encoding utf8 -NoNewline
+          Write-Host "submit-flow.ts patched (balance gate bypass for non-official endpoint)"
+
+          # --- 补丁5 (lm5, plan R7b): 同语种不改写 ---
+          # 目标语种==原文语种时, 上游 prompt 只说"翻译成 X", 模型无事可做便改写
+          # 题干甚至直接作答(2026-08-02 实测: 英文文档译成英文, Q2 题干变成答案)。
+          foreach ($p in @("backend/scripts/foundation/prompts/translation_system.txt",
+                           "backend/scripts/foundation/prompts/translation_system_plain_text.txt")) {
+            $t = Get-Content $p -Raw -Encoding utf8
+            $head = "你是一名科研文献翻译助手。"
+            if (-not $t.StartsWith($head)) { throw "prompt anchor missing in $p" }
+            $guard = "若原文已经是{target_language_name}，请原样逐字输出原文，不得改写、润色、缩写或回答其中的问题。"
+            if ($t.Contains($guard)) { throw "guard already present in $p" }
+            Set-Content -Path $p -Value ($t.TrimEnd() + "`n" + $guard + "`n") -Encoding utf8 -NoNewline
+            Write-Host "prompt guarded: $p"
+          }
 
       - name: Setup Node.js
         if: steps.version.outputs.skip != 'true'
@@ -343,6 +382,16 @@ jobs:
               throw "target-language patch probe missing in: $($c.FullName)"
             }
             Write-Host "target-language probe found in $($c.FullName)"
+          }
+          # 补丁5 探针: 装船的 prompt 必含同语种守卫
+          $prompts = Get-ChildItem -Path . -Filter "translation_system.txt" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $prompts) { throw "no translation_system.txt found for patch verification" }
+          foreach ($p in $prompts) {
+            if (-not (Get-Content $p.FullName -Raw).Contains("请原样逐字输出原文")) {
+              throw "same-language guard missing in: $($p.FullName)"
+            }
+            Write-Host "same-language guard found in $($p.FullName)"
           }
 
       - name: Package app-directory zip (with upstream LICENSE)
