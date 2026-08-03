@@ -36,8 +36,11 @@ name: Build Portable (Windows)
         # lm7 起 = 补回 MinerU 供应商定义(上游前端只剩 paddle, 导致 GUI 上传路径
         #          把 provider 静默回落成 paddle 并被 Paddle 校验卡死, 见补丁6);
         # lm8 起 = 主进程 desktop-config.js 的硬编码白名单也放开(否则 mineru 在送到
-        #          前端之前就被改写, lm7 的前端补丁形同虚设, 见补丁7)
-        default: "lm8"
+        #          前端之前就被改写, lm7 的前端补丁形同虚设, 见补丁7);
+        # lm9 起 = 目标语种选择器进 设置→任务选项(plan R12, 见补丁8) + 补丁3 改为
+        #          调用时解析 desktop-config(保存后下一单即生效) + 源=目标语种在
+        #          翻译前拦截(见补丁9)
+        default: "lm9"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -97,6 +100,10 @@ jobs:
         if: steps.version.outputs.skip != 'true' && steps.version.outputs.suffix != ''
         shell: pwsh
         run: |
+          # 引擎断言: 本步 8 处 Set-Content -Encoding utf8 改源文件, 而该参数在 5.1 下
+          # 写 BOM、在 pwsh 7 下不写。CI 恒为 pwsh, 但本地复现误用 5.1 会把 BOM 塞进源码;
+          # YAML 的 run: 块吃不到 #requires -Version, 只能显式断言。
+          if ($PSVersionTable.PSVersion.Major -lt 7) { throw "this step requires pwsh 7 (found $($PSVersionTable.PSVersion)): 5.1's -Encoding utf8 writes a BOM and would corrupt the patched sources" }
           # 上游 bug (v4.1.10 实查): React cutover 后 bootstrapDesktop() 只有定义无调用
           # (官方桌面用户没察觉, 因为他们在设置对话框手输过一次 key, 保存路径会写
           # localStorage 影子, 后续启动组合根从影子播种; 而外部预写 desktop-config.json
@@ -155,11 +162,14 @@ jobs:
           Set-Content -Path $pkgPath -Value $pkg -Encoding utf8 -NoNewline
           Write-Host "desktop/package.json homepage -> bk111/retain-pdf"
 
-          # --- 补丁3 (lm4, plan R7): 目标语种由环境变量注入 ---
-          # 上游把目标语言硬编码为简体中文(session_context 签名默认值, 全消费链
-          # 从 control context 取值已实查)。改为 import 时读 env, 由 words13 启动器
-          # 按用户选择注入 (Electron→Rust→Python 子进程链天然继承); env 缺省时
-          # 行为与上游完全一致。
+          # --- 补丁3 (lm4 立项, lm9 改版, plan R7/R12): 目标语种调用时解析 ---
+          # lm4 版是 import 时读 env(每次启动定值)。lm9 起改为**调用时**解析:
+          # RetainPDF 设置→任务选项 保存的 developerConfig.targetLanguage(Name)
+          # 落盘 desktop-config.json, 而每个翻译任务都是新起的 Python 进程
+          # (job_runner/worker_process.rs 每次 Command::new) —— 因此读盘放在调用点
+          # 就能做到"保存后下一单即生效、无需重启", 不动 Rust 与 stage spec。
+          # 优先级: desktop-config > 环境变量(words13 启动器注入的首次默认) >
+          # 上游原行为(简体中文)。显式传参的调用方(测试等)不受影响。
           $ctxPath = "backend/scripts/services/translation/services/context/session_context.py"
           $ctx = Get-Content $ctxPath -Raw -Encoding utf8
           if ($ctx.Contains("[lingomaster]")) { throw "patch marker already present in $ctxPath" }
@@ -168,21 +178,56 @@ jobs:
           $insert3 = @'
           from __future__ import annotations
 
-          # [lingomaster] R7 目标语种: 启动器经环境变量注入; 缺省=上游原行为(简体中文)。
-          import os
+          # [lingomaster] R7/R12 目标语种: 调用时解析(不能放模块常量/默认参数 ——
+          # Python 默认参数在 def 时求值, 做不到"改了下一单生效")。
+          # 优先 desktop-config.json 的 developerConfig(RetainPDF 设置→任务选项),
+          # 其次环境变量(words13 启动器注入), 最后回退上游原行为(简体中文)。
+          import json as _lm_json
+          import os as _lm_os
 
-          _LM_TARGET_LANG = os.environ.get("RETAIN_TARGET_LANG", "").strip() or "zh-CN"
-          _LM_TARGET_LANGUAGE_NAME = os.environ.get("RETAIN_TARGET_LANGUAGE_NAME", "").strip() or "简体中文"
+
+          def _lm_resolve_target_language() -> tuple[str, str]:
+              lang = ""
+              name = ""
+              try:
+                  appdata = _lm_os.environ.get("APPDATA", "")
+                  if appdata:
+                      for _dir in ("retain-pdf-desktop", "RetainPDF"):
+                          cfg_path = _lm_os.path.join(appdata, _dir, "desktop-config.json")
+                          if not _lm_os.path.isfile(cfg_path):
+                              continue
+                          with open(cfg_path, "r", encoding="utf-8-sig") as fh:
+                              dev = (_lm_json.load(fh) or {}).get("developerConfig") or {}
+                          lang = str(dev.get("targetLanguage") or "").strip()
+                          name = str(dev.get("targetLanguageName") or "").strip()
+                          break
+              except Exception:
+                  lang = ""
+                  name = ""
+              lang = lang or _lm_os.environ.get("RETAIN_TARGET_LANG", "").strip() or "zh-CN"
+              name = name or _lm_os.environ.get("RETAIN_TARGET_LANGUAGE_NAME", "").strip() or "简体中文"
+              return lang, name
           '@
           $ctx = $ctx.Replace($anchor3a, $insert3.Trim())
           # 多行锚点必须行尾无关: runner 的 checkout 工作树是 CRLF (git autocrlf),
           # 用 [regex]::Escape(行1) + '\r?\n' + Escape(行2) 匹配
           $pattern3b = [regex]::Escape('    target_lang: str = "zh-CN",') + '\r?\n' + [regex]::Escape('    target_language_name: str = "简体中文",')
           if ([regex]::Matches($ctx, $pattern3b).Count -ne 1) { throw "anchor3b (target defaults) missing/dup in $ctxPath" }
-          $ctx = [regex]::Replace($ctx, $pattern3b, "    target_lang: str = _LM_TARGET_LANG,`n    target_language_name: str = _LM_TARGET_LANGUAGE_NAME,")
+          $ctx = [regex]::Replace($ctx, $pattern3b, '    target_lang: str = "",' + "`n" + '    target_language_name: str = "",')
+          # 3c: 函数体内解析(哨兵空串=走默认)。锚在唯一的 control_context 调用行前。
+          $anchor3c = "    return build_translation_control_context("
+          if ([regex]::Matches($ctx, [regex]::Escape($anchor3c)).Count -ne 1) { throw "anchor3c missing/dup in $ctxPath" }
+          $insert3c = @'
+              # [lingomaster] 显式传参优先; 走默认(哨兵空串)时才解析 config/env。
+              if not str(target_lang or "").strip() or not str(target_language_name or "").strip():
+                  _lm_lang, _lm_name = _lm_resolve_target_language()
+                  target_lang = str(target_lang or "").strip() or _lm_lang
+                  target_language_name = str(target_language_name or "").strip() or _lm_name
+          '@
+          $ctx = $ctx.Replace($anchor3c, $insert3c.TrimEnd() + "`n" + $anchor3c)
           Set-Content -Path $ctxPath -Value $ctx -Encoding utf8 -NoNewline
-          Write-Host "session_context.py patched (target language via env)"
-          Select-String -Path $ctxPath -Pattern "RETAIN_TARGET" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
+          Write-Host "session_context.py patched (call-time target language resolution)"
+          Select-String -Path $ctxPath -Pattern "RETAIN_TARGET|targetLanguage" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
 
           # --- 补丁4 (lm5, plan R6.5b): 余额门禁对非官方端点放行 ---
           # 上游余额查询只认 api.deepseek.com(Rust deepseek_balance_url), 我们的
@@ -298,6 +343,418 @@ jobs:
             Set-Content -Path $p -Value ($t.TrimEnd() + "`n" + $guard + "`n") -Encoding utf8 -NoNewline
             Write-Host "prompt guarded: $p"
           }
+
+          # --- 补丁8 (lm9, plan R12): 目标语种选择器进 设置→任务选项 ---
+          # 位置拍板 TaskOptionsPanel(全文 60 行, 只有公式模式一个下拉, 补丁面最小)。
+          # 全链: TaskOptionsPanel <select ref> → elementsRef(credentials-view-store)
+          # → dialog-values 读取 → buildTaskOptionsFromDialogValues{targetLanguage,
+          # targetLanguageName} → saveTaskOptions → developerConfig → 主进程原样
+          # 落盘 desktop-config.json(实查 normalizeDesktopConfig 为 {...raw}) →
+          # Python 补丁3 调用时读取。回填链: rules.ts buildDeveloperConfigWithDefaults
+          # 是**白名单重建**(实查), 必须补 passthrough, 否则 dialog-sync 永远看不到。
+          # 语种表唯一事实源 = 新文件 js/config/lm-target-languages.ts; pages 世界经
+          # composition/external.ts 网关消费(架构门禁: home features 禁止直 import js/*)。
+          # 8a: 语种表新文件(code 与 words13 launcher TARGET_LANGUAGES 同表同码,
+          #     code 参与后端翻译缓存键 —— 各语种缓存互不污染的前提)
+          $langTablePath = "frontend/src/js/config/lm-target-languages.ts"
+          if (Test-Path $langTablePath) { throw "unexpected: $langTablePath already exists upstream" }
+          $langTable = @'
+          // [lingomaster] R12/lm9: RetainPDF 设置→任务选项 目标语种表(前端唯一事实源)。
+          // code 写进 developerConfig.targetLanguage 并参与后端翻译缓存键;
+          // name 为各语自称(免 i18n), 直接进提示词 {target_language_name}。
+          // 与 words13 retain_pdf_launcher.TARGET_LANGUAGES 保持同表同码。
+          export type LmTargetLanguage = { code: string; name: string };
+
+          export const LM_TARGET_LANGUAGES_COMMON: LmTargetLanguage[] = [
+            { code: "zh-CN", name: "简体中文" },
+            { code: "zh-TW", name: "繁體中文" },
+            { code: "en-US", name: "English" },
+            { code: "ja-JP", name: "日本語" },
+            { code: "ko-KR", name: "한국어" },
+          ];
+
+          export const LM_TARGET_LANGUAGES_MORE: LmTargetLanguage[] = [
+            { code: "es-ES", name: "Español" },
+            { code: "fr-FR", name: "Français" },
+            { code: "de-DE", name: "Deutsch" },
+            { code: "pt-BR", name: "Português" },
+            { code: "ru-RU", name: "Русский" },
+            { code: "it-IT", name: "Italiano" },
+            { code: "ar-SA", name: "العربية" },
+            { code: "th-TH", name: "ภาษาไทย" },
+            { code: "vi-VN", name: "Tiếng Việt" },
+            { code: "id-ID", name: "Bahasa Indonesia" },
+          ];
+
+          export const LM_TARGET_LANGUAGES: LmTargetLanguage[] = [
+            ...LM_TARGET_LANGUAGES_COMMON,
+            ...LM_TARGET_LANGUAGES_MORE,
+          ];
+
+          export const LM_DEFAULT_TARGET_LANGUAGE = "zh-CN";
+
+          export function lmNormalizeTargetLanguage(code: unknown = ""): string {
+            const value = `${code ?? ""}`.trim();
+            return LM_TARGET_LANGUAGES.some((lang) => lang.code === value)
+              ? value
+              : LM_DEFAULT_TARGET_LANGUAGE;
+          }
+
+          export function lmTargetLanguageName(code: unknown = ""): string {
+            const value = lmNormalizeTargetLanguage(code);
+            const hit = LM_TARGET_LANGUAGES.find((lang) => lang.code === value);
+            return hit ? hit.name : "简体中文";
+          }
+          '@
+          Set-Content -Path $langTablePath -Value $langTable -Encoding utf8 -NoNewline
+          Write-Host "created $langTablePath"
+
+          # 8b: composition/external.ts 网关 re-export(pages 世界唯一合法入口)
+          $extPath = "frontend/src/pages/home/composition/external.ts"
+          $ext = Get-Content $extPath -Raw -Encoding utf8
+          if ($ext.Contains("lm-target-languages")) { throw "patch marker already present in $extPath" }
+          $anchor8b = 'export { openDesktopOutputDirectory } from "../../../js/config/desktop-persistence.js";'
+          if ([regex]::Matches($ext, [regex]::Escape($anchor8b)).Count -ne 1) { throw "anchor8b missing/dup in $extPath" }
+          $ext = $ext.Replace($anchor8b, $anchor8b + "`n" + '// [lingomaster] lm9 目标语种表' + "`n" + 'export {' + "`n" + '  LM_TARGET_LANGUAGES_COMMON,' + "`n" + '  LM_TARGET_LANGUAGES_MORE,' + "`n" + '} from "../../../js/config/lm-target-languages.js";')
+          Set-Content -Path $extPath -Value $ext -Encoding utf8 -NoNewline
+          Write-Host "external.ts patched (lm-target-languages re-export)"
+
+          # 8c: DOM 契约 id
+          $idsPath = "frontend/src/pages/home/features/credentials/credentials-dom-ids.ts"
+          $ids = Get-Content $idsPath -Raw -Encoding utf8
+          if ($ids.Contains("browser-target-language")) { throw "patch marker already present in $idsPath" }
+          $anchor8c = '    mathMode: "browser-job-math-mode",'
+          if ([regex]::Matches($ids, [regex]::Escape($anchor8c)).Count -ne 1) { throw "anchor8c missing/dup in $idsPath" }
+          $ids = $ids.Replace($anchor8c, $anchor8c + "`n" + '    targetLanguage: "browser-target-language", // [lingomaster] lm9')
+          Set-Content -Path $idsPath -Value $ids -Encoding utf8 -NoNewline
+
+          # 8d: CredentialsElementsRef 类型
+          $typesPath = "frontend/src/pages/home/composition/types.ts"
+          $types = Get-Content $typesPath -Raw -Encoding utf8
+          if ($types.Contains("targetLanguageSelect")) { throw "patch marker already present in $typesPath" }
+          $anchor8d = '  mathModeSelect: HTMLSelectElement | null;'
+          if ([regex]::Matches($types, [regex]::Escape($anchor8d)).Count -ne 1) { throw "anchor8d missing/dup in $typesPath" }
+          $types = $types.Replace($anchor8d, $anchor8d + "`n" + '  targetLanguageSelect: HTMLSelectElement | null; // [lingomaster] lm9')
+          Set-Content -Path $typesPath -Value $types -Encoding utf8 -NoNewline
+
+          # 8e: elementsRef 初始化 + elements() 映射(store 驱动 elementsPort 是
+          #     React 世界 dialog-values/dialog-sync 的真实取数口, 实查)
+          $storePath = "frontend/src/pages/home/features/credentials/credentials-view-store.ts"
+          $store = Get-Content $storePath -Raw -Encoding utf8
+          if ($store.Contains("targetLanguageSelect")) { throw "patch marker already present in $storePath" }
+          $anchor8e1 = '    mathModeSelect: null,'
+          if ([regex]::Matches($store, [regex]::Escape($anchor8e1)).Count -ne 1) { throw "anchor8e1 missing/dup in $storePath" }
+          $store = $store.Replace($anchor8e1, $anchor8e1 + "`n" + '    targetLanguageSelect: null, // [lingomaster] lm9')
+          $anchor8e2 = '      mathModeSelect: elementsRef.mathModeSelect,'
+          if ([regex]::Matches($store, [regex]::Escape($anchor8e2)).Count -ne 1) { throw "anchor8e2 missing/dup in $storePath" }
+          $store = $store.Replace($anchor8e2, $anchor8e2 + "`n" + '      targetLanguageSelect: elementsRef.targetLanguageSelect, // [lingomaster] lm9')
+          Set-Content -Path $storePath -Value $store -Encoding utf8 -NoNewline
+          Write-Host "credentials-view-store.ts patched (elementsRef + elements mapping)"
+
+          # 8f: TaskOptionsPanel 加 <select>(非受控 ref, 与公式模式同款; optgroup
+          #     常用置顶其余归"更多语言"; 缺省显示 zh-CN, 打开对话框时由
+          #     dialog-sync 回填真实值)
+          $panelPath = "frontend/src/pages/home/features/credentials/TaskOptionsPanel.tsx"
+          $panel = Get-Content $panelPath -Raw -Encoding utf8
+          if ($panel.Contains("targetLanguageSelect")) { throw "patch marker already present in $panelPath" }
+          $anchor8f1 = 'import { CREDENTIAL_DOM_IDS } from "./credentials-dom-ids.js";'
+          if ([regex]::Matches($panel, [regex]::Escape($anchor8f1)).Count -ne 1) { throw "anchor8f1 missing/dup in $panelPath" }
+          $panel = $panel.Replace($anchor8f1, $anchor8f1 + "`n" + 'import { LM_TARGET_LANGUAGES_COMMON, LM_TARGET_LANGUAGES_MORE } from "../../composition/external.js"; // [lingomaster] lm9')
+          $anchor8f2 = '          {/* 模型地址/模型名不在旧模板可见布局里,但 dialog-values.js/'
+          if ([regex]::Matches($panel, [regex]::Escape($anchor8f2)).Count -ne 1) { throw "anchor8f2 missing/dup in $panelPath" }
+          $selectBlock = @'
+                    {/* [lingomaster] lm9 目标语种选择器(plan R12): 保存进 developerConfig,
+                        每个翻译任务都是新 Python 进程并在调用时读盘 —— 改完保存, 下一单
+                        即生效, 无需重启。 */}
+                    <label>
+                      <span className="developer-label">
+                        <span>目标语言</span>
+                      </span>
+                      <select
+                        id={BROWSER_IDS.targetLanguage}
+                        aria-label="目标语言"
+                        defaultValue="zh-CN"
+                        ref={(node) => { elementsRef.targetLanguageSelect = node || null; }}
+                      >
+                        <optgroup label="常用">
+                          {LM_TARGET_LANGUAGES_COMMON.map((lang) => (
+                            <option key={lang.code} value={lang.code}>{lang.name}</option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="更多语言">
+                          {LM_TARGET_LANGUAGES_MORE.map((lang) => (
+                            <option key={lang.code} value={lang.code}>{lang.name}</option>
+                          ))}
+                        </optgroup>
+                      </select>
+                    </label>
+          '@
+          $panel = $panel.Replace($anchor8f2, $selectBlock.TrimEnd("`r", "`n", " ").TrimStart("`r", "`n") + "`n" + $anchor8f2)
+          Set-Content -Path $panelPath -Value $panel -Encoding utf8 -NoNewline
+          Write-Host "TaskOptionsPanel.tsx patched (target language select)"
+
+          # 8g: dialog-values 读取 + 并入任务选项(targetLanguage=code 存回填/缓存键,
+          #     targetLanguageName=提示词用名, 一次保存同时落两个字段)
+          $dvPath = "frontend/src/js/features/credentials/dialog-values.ts"
+          $dv = Get-Content $dvPath -Raw -Encoding utf8
+          if ($dv.Contains("targetLanguageSelect")) { throw "patch marker already present in $dvPath" }
+          $anchor8g1 = 'import { createCredentialDialogElementsPort } from "./dialog-elements-port.js";'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g1)).Count -ne 1) { throw "anchor8g1 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g1, $anchor8g1 + "`n" + 'import { lmNormalizeTargetLanguage, lmTargetLanguageName } from "../../config/lm-target-languages.js"; // [lingomaster] lm9')
+          $anchor8g2 = '  mathMode: string;'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g2)).Count -ne 1) { throw "anchor8g2 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g2, $anchor8g2 + "`n" + '  targetLanguage: string; // [lingomaster] lm9')
+          $anchor8g3 = '  mathModeSelect?: { value?: string } | null;'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g3)).Count -ne 1) { throw "anchor8g3 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g3, $anchor8g3 + "`n" + '  targetLanguageSelect?: { value?: string } | null; // [lingomaster] lm9')
+          $anchor8g4 = '  values: Pick<CredentialDialogValues, "modelName" | "modelBaseUrl" | "mathMode">;'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g4)).Count -ne 1) { throw "anchor8g4 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g4, '  values: Pick<CredentialDialogValues, "modelName" | "modelBaseUrl" | "mathMode" | "targetLanguage">;')
+          $anchor8g5 = '    mathModeSelect,'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g5)).Count -ne 1) { throw "anchor8g5 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g5, $anchor8g5 + "`n" + '    targetLanguageSelect,')
+          $anchor8g6 = '    mathMode: mathModeSelect?.value || "direct_typst",'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g6)).Count -ne 1) { throw "anchor8g6 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g6, $anchor8g6 + "`n" + '    targetLanguage: lmNormalizeTargetLanguage(targetLanguageSelect?.value), // [lingomaster] lm9')
+          $anchor8g7 = '    mathMode: values.mathMode,'
+          if ([regex]::Matches($dv, [regex]::Escape($anchor8g7)).Count -ne 1) { throw "anchor8g7 missing/dup in $dvPath" }
+          $dv = $dv.Replace($anchor8g7, $anchor8g7 + "`n" + '    targetLanguage: lmNormalizeTargetLanguage(values.targetLanguage), // [lingomaster] lm9' + "`n" + '    targetLanguageName: lmTargetLanguageName(values.targetLanguage),')
+          Set-Content -Path $dvPath -Value $dv -Encoding utf8 -NoNewline
+          Write-Host "dialog-values.ts patched (read + build task options)"
+
+          # 8h: dialog-sync 回填(打开设置对话框时显示已存值; 缺省/未知显示 zh-CN)
+          $dsPath = "frontend/src/js/features/credentials/dialog-sync.ts"
+          $ds = Get-Content $dsPath -Raw -Encoding utf8
+          if ($ds.Contains("targetLanguageSelect")) { throw "patch marker already present in $dsPath" }
+          $anchor8h1 = 'import { normalizeOcrProvider } from "../../config/providers.js";'
+          if ([regex]::Matches($ds, [regex]::Escape($anchor8h1)).Count -ne 1) { throw "anchor8h1 missing/dup in $dsPath" }
+          $ds = $ds.Replace($anchor8h1, $anchor8h1 + "`n" + 'import { lmNormalizeTargetLanguage } from "../../config/lm-target-languages.js"; // [lingomaster] lm9')
+          $anchor8h2 = '    mathModeSelect,'
+          if ([regex]::Matches($ds, [regex]::Escape($anchor8h2)).Count -ne 1) { throw "anchor8h2 missing/dup in $dsPath" }
+          $ds = $ds.Replace($anchor8h2, $anchor8h2 + "`n" + '    targetLanguageSelect,')
+          $anchor8h3 = '  elementsPort.syncOcrProviderControls(normalizeOcrProvider(credentials.ocrProvider));'
+          if ([regex]::Matches($ds, [regex]::Escape($anchor8h3)).Count -ne 1) { throw "anchor8h3 missing/dup in $dsPath" }
+          $sync8h = '  if (targetLanguageSelect) {' + "`n" + '    // [lingomaster] lm9: 回填目标语种(缺省/未知一律显示简体中文)' + "`n" + '    targetLanguageSelect.value = lmNormalizeTargetLanguage(taskOptions.targetLanguage);' + "`n" + '  }' + "`n"
+          $ds = $ds.Replace($anchor8h3, $sync8h + $anchor8h3)
+          Set-Content -Path $dsPath -Value $ds -Encoding utf8 -NoNewline
+          Write-Host "dialog-sync.ts patched (backfill)"
+
+          # 8i: rules.ts buildDeveloperConfigWithDefaults 白名单补 passthrough
+          #     (回填链取数走这里, 不加字段等于白存)
+          $rulesPath = "frontend/src/js/features/workflow/rules.ts"
+          $rules = Get-Content $rulesPath -Raw -Encoding utf8
+          if ($rules.Contains("targetLanguage")) { throw "patch marker already present in $rulesPath" }
+          $anchor8i = '    translateTitles: source.translateTitles !== false,'
+          if ([regex]::Matches($rules, [regex]::Escape($anchor8i)).Count -ne 1) { throw "anchor8i missing/dup in $rulesPath" }
+          $rules8i = '    // [lingomaster] lm9: 白名单重建必须显式透传, 否则 dialog-sync 回填断链' + "`n" +
+                     '    targetLanguage: `${source.targetLanguage || ""}`.trim(),' + "`n" +
+                     '    targetLanguageName: `${source.targetLanguageName || ""}`.trim(),'
+          $rules = $rules.Replace($anchor8i, $anchor8i + "`n" + $rules8i)
+          Set-Content -Path $rulesPath -Value $rules -Encoding utf8 -NoNewline
+          Write-Host "rules.ts patched (developerConfig passthrough)"
+
+          # --- 补丁9 (lm9, plan R12): 源=目标语种在翻译前拦截 ---
+          # 落点 execution_plan: OCR JSON 已加载(扫描版也有文本, 判别最可靠),
+          # 且在 sci domain 推断(会打 LLM)与翻译编排之前 —— 拦下即省整笔 LLM 费。
+          # 新文件无锚点风险; execution_plan 两处单行锚。判别故意保守:
+          # 不确定一律放行; 简↔繁、拉丁语种互译(如法→英)不拦。
+          $guardPath = "backend/scripts/services/translation/workflow/lm_language_guard.py"
+          if (Test-Path $guardPath) { throw "unexpected: $guardPath already exists upstream" }
+          $guardPy = @'
+          """[lingomaster] R12: 源语种==目标语种时在调用翻译模型前终止作业.
+
+          落点: execution_plan.build_translation_execution_plan, OCR JSON 加载之后、
+          sci domain 推断(会打 LLM)与翻译编排之前。判别是启发式且故意保守:
+          只有"文档主导文字系统/功能词指纹"与目标语种高度一致才拦, 不确定一律
+          放行(绝不拦合法作业)。简↔繁互转、拉丁语种互译(如法→英)不拦。
+          """
+
+          from __future__ import annotations
+
+          import re
+
+
+          class SameLanguageError(RuntimeError):
+              """源=目标语种; 消息面向用户(出现在作业失败详情/日志里)."""
+
+
+          # 拉丁字母语种的功能词指纹(小而高频, 1-2KB 样本足够)
+          _LATIN_STOPWORDS = {
+              "en": {"the", "and", "of", "to", "in", "is", "that", "for", "with", "was"},
+              "es": {"el", "la", "los", "las", "que", "de", "en", "un", "una", "por"},
+              "fr": {"le", "la", "les", "des", "une", "est", "dans", "que", "pour", "avec"},
+              "de": {"der", "die", "das", "und", "ist", "von", "mit", "den", "für", "auf"},
+              "pt": {"o", "os", "das", "não", "uma", "para", "com", "por", "mais", "como"},
+              "it": {"il", "la", "che", "di", "non", "per", "una", "sono", "della", "nel"},
+              "vi": {"và", "của", "là", "có", "trong", "được", "các", "một", "này", "cho"},
+              "id": {"yang", "dan", "di", "ini", "itu", "dengan", "untuk", "tidak", "dari", "pada"},
+          }
+
+          # 简体独有/繁体独有高频字(区分 zh-CN/zh-TW; 繁→简、简→繁是合法作业不拦)
+          _SIMPLIFIED_ONLY = "们这说对还没会过时发当动经现给点书体万东车门问题读写头买"
+          _TRADITIONAL_ONLY = "們這說對還沒會過時發當動經現給點書體萬東車門問題讀寫頭買"
+
+
+          def _script_counts(text: str) -> dict:
+              counts = {
+                  "han": 0, "kana": 0, "hangul": 0, "latin": 0, "cyrillic": 0,
+                  "arabic": 0, "thai": 0, "simp": 0, "trad": 0, "total_letters": 0,
+              }
+              for ch in text:
+                  code = ord(ch)
+                  if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+                      counts["han"] += 1
+                      counts["total_letters"] += 1
+                      if ch in _SIMPLIFIED_ONLY:
+                          counts["simp"] += 1
+                      elif ch in _TRADITIONAL_ONLY:
+                          counts["trad"] += 1
+                  elif 0x3040 <= code <= 0x30FF:
+                      counts["kana"] += 1
+                      counts["total_letters"] += 1
+                  elif 0xAC00 <= code <= 0xD7AF:
+                      counts["hangul"] += 1
+                      counts["total_letters"] += 1
+                  elif (0x0041 <= code <= 0x005A) or (0x0061 <= code <= 0x007A) \
+                          or (0x00C0 <= code <= 0x024F) or (0x1E00 <= code <= 0x1EFF):
+                      counts["latin"] += 1
+                      counts["total_letters"] += 1
+                  elif 0x0400 <= code <= 0x04FF:
+                      counts["cyrillic"] += 1
+                      counts["total_letters"] += 1
+                  elif 0x0600 <= code <= 0x06FF:
+                      counts["arabic"] += 1
+                      counts["total_letters"] += 1
+                  elif 0x0E00 <= code <= 0x0E7F:
+                      counts["thai"] += 1
+                      counts["total_letters"] += 1
+              return counts
+
+
+          def _dominant(counts: dict, key: str, ratio: float = 0.6) -> bool:
+              total = counts["total_letters"]
+              return total >= 40 and counts[key] >= total * ratio
+
+
+          def _latin_language_matches(text: str, expected: str) -> bool:
+              """文本呈现 expected 语种的功能词指纹, 且明显强于其它拉丁语种."""
+              words = re.findall(r"[a-zA-ZÀ-ÿĀ-ſḀ-ỿ]+", text.lower())
+              if len(words) < 30:
+                  return False
+              scores = {
+                  lang: sum(1 for w in words if w in stopset)
+                  for lang, stopset in _LATIN_STOPWORDS.items()
+              }
+              expected_score = scores.get(expected, 0)
+              if expected_score < max(5, len(words) * 0.02):
+                  return False
+              best_other = max((s for l, s in scores.items() if l != expected), default=0)
+              return expected_score > best_other * 1.5
+
+
+          def collect_sample_text(data: dict, start: int, stop: int,
+                                  max_blocks: int = 80, max_chars: int = 6000) -> str:
+              """从已选页范围抽正文样本(与翻译同源的 extract_text_items, 扫描版同样有效)."""
+              from services.translation.core.ocr.json_extractor import extract_text_items
+
+              parts: list[str] = []
+              total = 0
+              for page_idx in range(start, stop + 1):
+                  try:
+                      items = extract_text_items(data, page_idx=page_idx)
+                  except Exception:
+                      continue
+                  for item in items:
+                      text = (getattr(item, "text", "") or "").strip()
+                      if not text:
+                          continue
+                      parts.append(text)
+                      total += len(text)
+                      if len(parts) >= max_blocks or total >= max_chars:
+                          return "\n".join(parts)
+              return "\n".join(parts)
+
+
+          def detect_conflict(sample_text: str, target_lang: str, target_language_name: str) -> str:
+              """判定"文档已是目标语种"则返回用户可读描述, 否则空串(放行)."""
+              text = (sample_text or "").strip()
+              if not text:
+                  return ""
+              counts = _script_counts(text)
+              code = (target_lang or "").strip()
+              primary = code.lower().replace("_", "-").split("-")[0]
+
+              if primary == "zh":
+                  if not _dominant(counts, "han") or counts["kana"] > counts["total_letters"] * 0.05:
+                      return ""
+                  simp, trad = counts["simp"], counts["trad"]
+                  is_tw = code.lower() in ("zh-tw", "zh-hant", "zh-hk", "zh-mo")
+                  if simp + trad >= 5:
+                      doc_is_trad = trad > simp * 2
+                      doc_is_simp = simp > trad * 2
+                      if is_tw and not doc_is_trad:
+                          return ""
+                      if (not is_tw) and not doc_is_simp:
+                          return ""
+                  return "文档正文已是中文"
+              if primary == "ja":
+                  if counts["kana"] >= max(20, counts["total_letters"] * 0.1):
+                      return "文档正文已是日文"
+                  return ""
+              if primary == "ko":
+                  return "文档正文已是韩文" if _dominant(counts, "hangul") else ""
+              if primary == "ru":
+                  return "文档正文已是俄文" if _dominant(counts, "cyrillic") else ""
+              if primary == "ar":
+                  return "文档正文已是阿拉伯文" if _dominant(counts, "arabic") else ""
+              if primary == "th":
+                  return "文档正文已是泰文" if _dominant(counts, "thai") else ""
+              if primary in _LATIN_STOPWORDS and _dominant(counts, "latin"):
+                  if _latin_language_matches(text, primary):
+                      display = (target_language_name or code).strip()
+                      return f"文档正文已是目标语言({display})"
+              return ""
+
+
+          def ensure_target_language_differs(sample_text: str, target_lang: str,
+                                             target_language_name: str) -> None:
+              verdict = detect_conflict(sample_text, target_lang, target_language_name)
+              if verdict:
+                  display = (target_language_name or target_lang or "").strip()
+                  raise SameLanguageError(
+                      f"{verdict}, 与目标翻译语言({display})相同, 已在调用翻译模型前停止, "
+                      "本次不产生模型费用。请在 RetainPDF 的 设置 → 任务选项 → 目标语言 "
+                      "里换一种语言后重新提交。"
+                  )
+          '@
+          Set-Content -Path $guardPath -Value $guardPy -Encoding utf8 -NoNewline
+          Write-Host "created $guardPath"
+
+          # 9b: execution_plan 接线(两处单行锚)
+          $planPath = "backend/scripts/services/translation/workflow/execution_plan.py"
+          $plan = Get-Content $planPath -Raw -Encoding utf8
+          if ($plan.Contains("lm_language_guard")) { throw "patch marker already present in $planPath" }
+          $anchor9b1 = "from services.translation.workflow.page_range import resolve_page_range"
+          if ([regex]::Matches($plan, [regex]::Escape($anchor9b1)).Count -ne 1) { throw "anchor9b1 missing/dup in $planPath" }
+          $imports9 = $anchor9b1 + "`n" + "from services.translation.workflow.lm_language_guard import collect_sample_text as _lm_collect_sample_text  # [lingomaster] R12" + "`n" + "from services.translation.workflow.lm_language_guard import ensure_target_language_differs as _lm_ensure_target_differs" + "`n" + "from services.translation.services.context.session_context import _lm_resolve_target_language"
+          $plan = $plan.Replace($anchor9b1, $imports9)
+          $anchor9b2 = "    start, stop = resolve_page_range(page_count, request.start_page, request.end_page)"
+          if ([regex]::Matches($plan, [regex]::Escape($anchor9b2)).Count -ne 1) { throw "anchor9b2 missing/dup in $planPath" }
+          $guardCall = @'
+              start, stop = resolve_page_range(page_count, request.start_page, request.end_page)
+
+              # [lingomaster] R12: 源=目标语种在任何 LLM 调用(含 sci domain 推断)之前
+              # 拦截; 判别保守, 不确定一律放行, 详见 lm_language_guard.py。
+              _lm_lang, _lm_name = _lm_resolve_target_language()
+              _lm_ensure_target_differs(
+                  _lm_collect_sample_text(data, start, stop),
+                  _lm_lang,
+                  _lm_name,
+              )
+          '@
+          $plan = $plan.Replace($anchor9b2, $guardCall.TrimEnd())
+          Set-Content -Path $planPath -Value $plan -Encoding utf8 -NoNewline
+          Write-Host "execution_plan.py patched (same-language guard wired)"
 
       - name: Setup Node.js
         if: steps.version.outputs.skip != 'true'
@@ -432,7 +889,7 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         shell: pwsh
         run: |
-          Get-Content desktop/app/backend/bundle-manifest.json
+          Get-Content desktop/app/backend/bundle-manifest.json -Encoding utf8
           npm --prefix desktop run smoke:frontend-bundle
           python .github/scripts/validate_desktop_bundle.py --manifest desktop/app/backend/bundle-manifest.json
 
@@ -442,11 +899,14 @@ jobs:
         run: |
           # esbuild minify 会剥注释/重命名标识符, 用补丁里的 console.error 字符串字面量作探针;
           # 全树搜产物 (frontend/dist 与 desktop/app 各有一份), 每份都必须含探针
+          # 本步所有 Get-Content 必须显式 -Encoding utf8: 探针里有中文字面量, 缺了这个参数
+          # 在 Windows PowerShell 5.1 下会按 ANSI(本机 cp1252) 读成乱码 —— 正向探针假失败,
+          # 反向探针(457 行)假通过。CI 是 pwsh 7 默认 UTF-8 看不出来, 本地复现才炸。
           $bundles = Get-ChildItem -Path . -Filter "app.bundle.js" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
           if (-not $bundles) { throw "no app.bundle.js found for patch verification" }
           foreach ($b in $bundles) {
-            $text = Get-Content $b.FullName -Raw
+            $text = Get-Content $b.FullName -Raw -Encoding utf8
             if (-not $text.Contains("[lingomaster] desktop config bootstrap failed")) {
               throw "bootstrap patch probe missing in built bundle: $($b.FullName)"
             }
@@ -461,24 +921,49 @@ jobs:
             if (-not $text.Contains("LingoMaster")) {
               throw "MinerU provider definition missing in: $($b.FullName)"
             }
-            Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed) in $($b.FullName)"
+            # 补丁8: 目标语种选择器(DOM id 字面量 + 语种表条目, minify 后都保留)
+            if (-not $text.Contains("browser-target-language")) {
+              throw "target-language selector probe (dom id) missing in: $($b.FullName)"
+            }
+            if (-not $text.Contains("繁體中文")) {
+              throw "target-language table probe missing in: $($b.FullName)"
+            }
+            Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed + lang selector) in $($b.FullName)"
           }
-          # 补丁3 探针: 打包进 app 的后端 python 必含目标语种 env 读取
+          # 补丁3 探针: 打包进 app 的后端 python 必含 env 回退 + desktop-config 读取
           $ctxCopies = Get-ChildItem -Path . -Filter "session_context.py" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
           if (-not $ctxCopies) { throw "no session_context.py found for patch verification" }
           foreach ($c in $ctxCopies) {
-            if (-not (Get-Content $c.FullName -Raw).Contains("RETAIN_TARGET_LANGUAGE_NAME")) {
-              throw "target-language patch probe missing in: $($c.FullName)"
+            $ctxText = Get-Content $c.FullName -Raw -Encoding utf8
+            if (-not $ctxText.Contains("RETAIN_TARGET_LANGUAGE_NAME")) {
+              throw "target-language env probe missing in: $($c.FullName)"
             }
-            Write-Host "target-language probe found in $($c.FullName)"
+            if (-not $ctxText.Contains("targetLanguageName")) {
+              throw "target-language desktop-config probe (lm9 call-time resolution) missing in: $($c.FullName)"
+            }
+            Write-Host "target-language probes found in $($c.FullName)"
+          }
+          # 补丁9 探针: 同语种守卫文件在船上, 且 execution_plan 完成接线
+          $guardCopies = Get-ChildItem -Path . -Filter "lm_language_guard.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $guardCopies) { throw "no lm_language_guard.py found for patch verification" }
+          $guardCopies | ForEach-Object { Write-Host "language guard present: $($_.FullName)" }
+          $planCopies = Get-ChildItem -Path . -Filter "execution_plan.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $planCopies) { throw "no execution_plan.py found for patch verification" }
+          foreach ($pc in $planCopies) {
+            if (-not (Get-Content $pc.FullName -Raw -Encoding utf8).Contains("lm_language_guard")) {
+              throw "same-language guard wiring missing in: $($pc.FullName)"
+            }
+            Write-Host "guard wiring found in $($pc.FullName)"
           }
           # 补丁7 探针: 主进程的 provider 白名单(asar 内主进程代码不压缩, 标记可直查)
           $mains = Get-ChildItem -Path . -Filter "desktop-config.js" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
           if (-not $mains) { throw "no desktop-config.js found for patch verification" }
           foreach ($m in $mains) {
-            $mt = Get-Content $m.FullName -Raw
+            $mt = Get-Content $m.FullName -Raw -Encoding utf8
             if (-not $mt.Contains("[lingomaster] main-process OCR provider whitelist")) {
               throw "main-process provider whitelist patch missing in: $($m.FullName)"
             }
@@ -492,7 +977,7 @@ jobs:
             Where-Object { $_.FullName -notmatch "node_modules" }
           if (-not $prompts) { throw "no translation_system.txt found for patch verification" }
           foreach ($p in $prompts) {
-            if (-not (Get-Content $p.FullName -Raw).Contains("请原样逐字输出原文")) {
+            if (-not (Get-Content $p.FullName -Raw -Encoding utf8).Contains("请原样逐字输出原文")) {
               throw "same-language guard missing in: $($p.FullName)"
             }
             Write-Host "same-language guard found in $($p.FullName)"
