@@ -913,19 +913,25 @@ jobs:
             if (-not $text.Contains("bk111/retain-pdf")) {
               throw "update-redirect probe (GITHUB_REPO=bk111/retain-pdf) missing in: $($b.FullName)"
             }
-            # 反向探针(补丁4b): 那句拦死提交的红字必须从产物里彻底消失
-            if ($text.Contains("无法确认 DeepSeek 余额")) {
+            # 反向探针(补丁4b): 那句拦死提交的红字必须从产物里彻底消失。
+            # esbuild 默认把非 ASCII 输出成 \uXXXX 转义 —— 只查中文字面量是
+            # **空转假通过**(lm9 首轮构建实证: 正向中文探针找不到才暴露),
+            # 必须连转义形态一起查。
+            $gateEscaped = -join ("无法确认 DeepSeek 余额".ToCharArray() | ForEach-Object { $c = [int]$_; if ($c -gt 127) { '\u{0:x4}' -f $c } else { [string]$_ } })
+            if ($text.Contains("无法确认 DeepSeek 余额") -or $text.ToLowerInvariant().Contains($gateEscaped.ToLowerInvariant())) {
               throw "balance-unknown gate still present in: $($b.FullName)"
             }
             # 补丁6: MinerU 供应商定义必须在册(否则 provider 又被回落成 paddle)
             if (-not $text.Contains("LingoMaster")) {
               throw "MinerU provider definition missing in: $($b.FullName)"
             }
-            # 补丁8: 目标语种选择器(DOM id 字面量 + 语种表条目, minify 后都保留)
+            # 补丁8: 目标语种选择器(DOM id 字面量 + 语种表条目)。探针必须用
+            # 纯 ASCII 串 —— esbuild 把非 ASCII 转义成 \uXXXX, 中文字面量在
+            # bundle 里根本找不到(lm9 首轮构建以"繁體中文"作探针即因此失败)。
             if (-not $text.Contains("browser-target-language")) {
               throw "target-language selector probe (dom id) missing in: $($b.FullName)"
             }
-            if (-not $text.Contains("繁體中文")) {
+            if (-not $text.Contains("Bahasa Indonesia")) {
               throw "target-language table probe missing in: $($b.FullName)"
             }
             Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed + lang selector) in $($b.FullName)"
