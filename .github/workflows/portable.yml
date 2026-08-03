@@ -976,24 +976,26 @@ jobs:
             }
             Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed + lang selector) in $($b.FullName)"
           }
-          # 补丁10 探针: 三页 bundle (home/detail/reader) 都消费 artifacts.ts 的
-          # 下载名产源 —— 正向查 console.error 字面量标记, 反向查写死的
-          # `zh_${` 模板必须消失 (minify 后模板字面量分片保留, 可直查)
-          foreach ($bundleName in @("app.bundle.js", "reader.bundle.js", "detail.bundle.js")) {
-            $copies = Get-ChildItem -Path . -Filter $bundleName -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -notmatch "node_modules" }
-            if (-not $copies) { throw "no $bundleName found for lm10 probe" }
-            foreach ($bc in $copies) {
-              $bt = Get-Content $bc.FullName -Raw -Encoding utf8
-              if (-not $bt.Contains("lm10-prefix-by-target-language")) {
-                throw "lm10 prefix probe missing in: $($bc.FullName)"
-              }
-              if ($bt.Contains('zh_${')) {
-                throw "hard-coded zh_ template still present in: $($bc.FullName)"
-              }
+          # 补丁10 探针: 聚合断言, 不逐 bundle 要求正向标记 —— resolveTranslated
+          # PdfDownloadName 只被 home/reader 消费, detail 页不引用, esbuild 会把
+          # 它整段 tree-shake 掉 (lm10 首轮构建实证: detail.bundle.js 正向探针
+          # 假失败, 而同一份的反向探针通过 = 那份根本没有这段代码)。
+          # 正向: 至少一份产物含标记(补丁确实进了船); 反向: 所有产物都不得残留
+          # 写死的 `zh_${` 模板(硬编码彻底消失)。
+          $allBundles = Get-ChildItem -Path . -Filter "*.bundle.js" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $allBundles) { throw "no *.bundle.js found for lm10 probe" }
+          $lm10Hits = @()
+          foreach ($bc in $allBundles) {
+            $bt = Get-Content $bc.FullName -Raw -Encoding utf8
+            if ($bt.Contains("lm10-prefix-by-target-language")) { $lm10Hits += $bc.FullName }
+            if ($bt.Contains('zh_${')) {
+              throw "hard-coded zh_ template still present in: $($bc.FullName)"
             }
-            Write-Host "lm10 prefix probes OK in $bundleName x$($copies.Count)"
           }
+          if (-not $lm10Hits) { throw "lm10 prefix probe missing in every bundle" }
+          Write-Host "lm10 prefix probes OK (marker in $($lm10Hits.Count)/$($allBundles.Count) bundles, no hard-coded zh_ anywhere)"
+          $lm10Hits | ForEach-Object { Write-Host "  marker: $_" }
           # 补丁3 探针: 打包进 app 的后端 python 必含 env 回退 + desktop-config 读取
           $ctxCopies = Get-ChildItem -Path . -Filter "session_context.py" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
