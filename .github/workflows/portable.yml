@@ -34,8 +34,10 @@ name: Build Portable (Windows)
         # lm5 起 = 余额门禁对非官方端点放行 + 同语种不改写 prompt 守卫;
         # lm6 起 = 移除"余额未检测"最终门禁(lm5 补的分支走不到, 见补丁4b);
         # lm7 起 = 补回 MinerU 供应商定义(上游前端只剩 paddle, 导致 GUI 上传路径
-        #          把 provider 静默回落成 paddle 并被 Paddle 校验卡死, 见补丁6)
-        default: "lm7"
+        #          把 provider 静默回落成 paddle 并被 Paddle 校验卡死, 见补丁6);
+        # lm8 起 = 主进程 desktop-config.js 的硬编码白名单也放开(否则 mineru 在送到
+        #          前端之前就被改写, lm7 的前端补丁形同虚设, 见补丁7)
+        default: "lm8"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -263,6 +265,26 @@ jobs:
           Set-Content -Path $provPath -Value $prov -Encoding utf8 -NoNewline
           Write-Host "providers.ts patched (MinerU provider restored, default -> mineru)"
 
+          # --- 补丁7 (lm8, plan R11b): 主进程也有一份硬编码白名单 ---
+          # desktop/src/main/desktop-config.js:
+          #   function normalizeOcrProvider(value) {
+          #     return value === "paddle" ? "paddle" : DEFAULT_OCR_PROVIDER;   // "paddle"
+          #   }
+          # 任何非 "paddle" 的值都被强行改写 → 我们注入的 mineru 在**送到前端之前**
+          # 就没了, 所以 lm7 只补前端的 providers.ts 不起作用(实测 lm7 仍报
+          # "Paddle Access Token 无效")。这里把白名单放开并把默认值改成 mineru。
+          $mainCfg = "desktop/src/main/desktop-config.js"
+          $mc = Get-Content $mainCfg -Raw -Encoding utf8
+          if ($mc.Contains("[lingomaster]")) { throw "patch marker already present in $mainCfg" }
+          $anchor7a = 'const DEFAULT_OCR_PROVIDER = "paddle";'
+          if ([regex]::Matches($mc, [regex]::Escape($anchor7a)).Count -ne 1) { throw "anchor7a missing/dup in $mainCfg" }
+          $mc = $mc.Replace($anchor7a, 'const DEFAULT_OCR_PROVIDER = "mineru";  // [lingomaster] main-process OCR provider whitelist')
+          $anchor7b = 'return value === "paddle" ? "paddle" : DEFAULT_OCR_PROVIDER;'
+          if ([regex]::Matches($mc, [regex]::Escape($anchor7b)).Count -ne 1) { throw "anchor7b missing/dup in $mainCfg" }
+          $mc = $mc.Replace($anchor7b, 'return (value === "paddle" || value === "mineru") ? value : DEFAULT_OCR_PROVIDER;')
+          Set-Content -Path $mainCfg -Value $mc -Encoding utf8 -NoNewline
+          Write-Host "desktop-config.js patched (main-process provider whitelist accepts mineru)"
+
           # --- 补丁5 (lm5, plan R7b): 同语种不改写 ---
           # 目标语种==原文语种时, 上游 prompt 只说"翻译成 X", 模型无事可做便改写
           # 题干甚至直接作答(2026-08-02 实测: 英文文档译成英文, Q2 题干变成答案)。
@@ -450,6 +472,20 @@ jobs:
               throw "target-language patch probe missing in: $($c.FullName)"
             }
             Write-Host "target-language probe found in $($c.FullName)"
+          }
+          # 补丁7 探针: 主进程的 provider 白名单(asar 内主进程代码不压缩, 标记可直查)
+          $mains = Get-ChildItem -Path . -Filter "desktop-config.js" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $mains) { throw "no desktop-config.js found for patch verification" }
+          foreach ($m in $mains) {
+            $mt = Get-Content $m.FullName -Raw
+            if (-not $mt.Contains("[lingomaster] main-process OCR provider whitelist")) {
+              throw "main-process provider whitelist patch missing in: $($m.FullName)"
+            }
+            if (-not $mt.Contains('value === "mineru"')) {
+              throw "main-process whitelist does not accept mineru in: $($m.FullName)"
+            }
+            Write-Host "main-process provider probe OK in $($m.FullName)"
           }
           # 补丁5 探针: 装船的 prompt 必含同语种守卫
           $prompts = Get-ChildItem -Path . -Filter "translation_system.txt" -Recurse -File -ErrorAction SilentlyContinue |
