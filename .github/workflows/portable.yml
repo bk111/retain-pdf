@@ -39,8 +39,9 @@ name: Build Portable (Windows)
         #          前端之前就被改写, lm7 的前端补丁形同虚设, 见补丁7);
         # lm9 起 = 目标语种选择器进 设置→任务选项(plan R12, 见补丁8) + 补丁3 改为
         #          调用时解析 desktop-config(保存后下一单即生效) + 源=目标语种在
-        #          翻译前拦截(见补丁9)
-        default: "lm9"
+        #          翻译前拦截(见补丁9);
+        # lm10 起 = 译后文件名前缀跟随目标语种(上游硬编码 zh_, 见补丁10)
+        default: "lm10"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -405,6 +406,13 @@ jobs:
             const hit = LM_TARGET_LANGUAGES.find((lang) => lang.code === value);
             return hit ? hit.name : "简体中文";
           }
+
+          export function lmTargetLanguagePrefix(code: unknown = ""): string {
+            // [lingomaster] lm10 文件名前缀: 主子标签小写 (zh-CN→zh, es-ES→es);
+            // 繁体族保留全码区分简体 (zh-TW→zh-TW)。
+            const value = lmNormalizeTargetLanguage(code);
+            return value === "zh-TW" ? "zh-TW" : value.split("-")[0].toLowerCase();
+          }
           '@
           Set-Content -Path $langTablePath -Value $langTable -Encoding utf8 -NoNewline
           Write-Host "created $langTablePath"
@@ -552,6 +560,38 @@ jobs:
           $rules = $rules.Replace($anchor8i, $anchor8i + "`n" + $rules8i)
           Set-Content -Path $rulesPath -Value $rules -Encoding utf8 -NoNewline
           Write-Host "rules.ts patched (developerConfig passthrough)"
+
+          # --- 补丁10 (lm10, plan R14 条目1): 译后文件名前缀跟随目标语种 ---
+          # 上游硬编码 `zh_${originalName}.pdf` (js/job/artifacts.ts 的
+          # resolveTranslatedPdfDownloadName 是唯一产源, home/detail/reader
+          # 三页下载名都经它) —— "目标恒中文"时代的遗留。前缀改从当前
+          # developerConfig.targetLanguage 解析 (与译文语种同源); 作业级历史
+          # 语种不可得(payload 无语言字段), 常规"译完即下载"流程两者一致。
+          $artPath = "frontend/src/js/job/artifacts.ts"
+          $art = Get-Content $artPath -Raw -Encoding utf8
+          if ($art.Contains("lmTargetLanguagePrefix")) { throw "patch marker already present in $artPath" }
+          $anchor10a = 'import { defaultArtifactRuntimePort } from "./artifact-runtime-port.js";'
+          if ([regex]::Matches($art, [regex]::Escape($anchor10a)).Count -ne 1) { throw "anchor10a missing/dup in $artPath" }
+          $art = $art.Replace($anchor10a, $anchor10a + "`n" + 'import { lmTargetLanguagePrefix } from "../config/lm-target-languages.js"; // [lingomaster] lm10' + "`n" + 'import { loadDeveloperStoredConfig } from "../config/persisted-config.js"; // [lingomaster] lm10')
+          $anchor10b = '  return originalName ? `zh_${originalName}.pdf` : fallbackName;'
+          if ([regex]::Matches($art, [regex]::Escape($anchor10b)).Count -ne 1) { throw "anchor10b missing/dup in $artPath" }
+          $replace10 = @'
+            if (!originalName) {
+              return fallbackName;
+            }
+            // [lingomaster] lm10: 前缀跟随目标语种(读当前 developerConfig)
+            let lmPrefix = "";
+            try {
+              const lmConfig = loadDeveloperStoredConfig() as { targetLanguage?: unknown } | null;
+              lmPrefix = lmTargetLanguagePrefix(lmConfig?.targetLanguage);
+            } catch (error) {
+              console.error("[lingomaster] lm10-prefix-by-target-language fallback:", error);
+            }
+            return `${lmPrefix || "zh"}_${originalName}.pdf`;
+          '@
+          $art = $art.Replace($anchor10b, $replace10.TrimEnd("`r", "`n", " ").TrimStart("`r", "`n"))
+          Set-Content -Path $artPath -Value $art -Encoding utf8 -NoNewline
+          Write-Host "artifacts.ts patched (language-aware translated pdf prefix)"
 
           # --- 补丁9 (lm9, plan R12): 源=目标语种在翻译前拦截 ---
           # 落点 execution_plan: OCR JSON 已加载(扫描版也有文本, 判别最可靠),
@@ -935,6 +975,24 @@ jobs:
               throw "target-language table probe missing in: $($b.FullName)"
             }
             Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed + lang selector) in $($b.FullName)"
+          }
+          # 补丁10 探针: 三页 bundle (home/detail/reader) 都消费 artifacts.ts 的
+          # 下载名产源 —— 正向查 console.error 字面量标记, 反向查写死的
+          # `zh_${` 模板必须消失 (minify 后模板字面量分片保留, 可直查)
+          foreach ($bundleName in @("app.bundle.js", "reader.bundle.js", "detail.bundle.js")) {
+            $copies = Get-ChildItem -Path . -Filter $bundleName -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch "node_modules" }
+            if (-not $copies) { throw "no $bundleName found for lm10 probe" }
+            foreach ($bc in $copies) {
+              $bt = Get-Content $bc.FullName -Raw -Encoding utf8
+              if (-not $bt.Contains("lm10-prefix-by-target-language")) {
+                throw "lm10 prefix probe missing in: $($bc.FullName)"
+              }
+              if ($bt.Contains('zh_${')) {
+                throw "hard-coded zh_ template still present in: $($bc.FullName)"
+              }
+            }
+            Write-Host "lm10 prefix probes OK in $bundleName x$($copies.Count)"
           }
           # 补丁3 探针: 打包进 app 的后端 python 必含 env 回退 + desktop-config 读取
           $ctxCopies = Get-ChildItem -Path . -Filter "session_context.py" -Recurse -File -ErrorAction SilentlyContinue |
