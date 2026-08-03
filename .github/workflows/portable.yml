@@ -31,8 +31,9 @@ name: Build Portable (Windows)
         # lm3 起 = 附带更新导流禁用补丁(自动检查关 + GITHUB_REPO 指 fork, plan R6.5);
         # lm4 起 = 目标语种 env 注入补丁(session_context 默认值改读
         # RETAIN_TARGET_LANG(_UAGE_NAME), plan R7);
-        # lm5 起 = 余额门禁对非官方端点放行 + 同语种不改写 prompt 守卫
-        default: "lm5"
+        # lm5 起 = 余额门禁对非官方端点放行 + 同语种不改写 prompt 守卫;
+        # lm6 起 = 移除"余额未检测"最终门禁(lm5 补的分支走不到, 见补丁4b)
+        default: "lm6"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -200,8 +201,24 @@ jobs:
           # 不再二次剥缩进: YAML 块标量已剥掉 10 空格, here-string 内容即为
           # 目标缩进(if/} 4 格、函数体 6 格), 与 submit-flow.ts 周围代码一致
           $flow = $flow.Replace($anchor4, $insert4.TrimEnd() + "`n" + $anchor4)
+
+          # --- 补丁4b (lm6): 真正拦住提交的是"余额未检测"这道最终门禁 ---
+          # lm5 只补了 unsupported_provider 分支, 但那条分支走不到: 余额查询前
+          # 先做连通性校验(providers/deepseek/validate-token), 我们的代理没有该
+          # 端点 → 校验就失败 → 返回的是连通性结果(status 非 unsupported_provider)
+          # → 直接落到下面这道门禁 → 提交被永久卡死(2026-08-02 实测 lm5 仍复现)。
+          # 余额未知不再拦截: 额度与计费由服务端 credits 门禁负责(不足返回 402)。
+          # budget.blocking 保留 —— 那是真查到余额且不足才触发, 自带 key 的用户仍有效。
+          $pattern4b = [regex]::Escape('  if (budget?.visible && !budget.balanceChecked) {') + '\r?\n' +
+                       [regex]::Escape('    setText("error-box", "无法确认 DeepSeek 余额，请先在接口设置中完成检测。");') + '\r?\n' +
+                       [regex]::Escape('    return false;') + '\r?\n' +
+                       [regex]::Escape('  }')
+          if ([regex]::Matches($flow, $pattern4b).Count -ne 1) { throw "anchor4b (balance-unknown gate) missing/dup in $flowPath" }
+          $replace4b = '  // [lingomaster] 余额未知不拦提交: base_url 是我方代理, 上游余额接口只认' + "`n" +
+                       '  // api.deepseek.com, 此处恒为"未检测"; 额度与计费由服务端 credits 门禁负责。'
+          $flow = [regex]::Replace($flow, $pattern4b, $replace4b)
           Set-Content -Path $flowPath -Value $flow -Encoding utf8 -NoNewline
-          Write-Host "submit-flow.ts patched (balance gate bypass for non-official endpoint)"
+          Write-Host "submit-flow.ts patched (balance gate bypass + balance-unknown gate removed)"
 
           # --- 补丁5 (lm5, plan R7b): 同语种不改写 ---
           # 目标语种==原文语种时, 上游 prompt 只说"翻译成 X", 模型无事可做便改写
@@ -371,7 +388,11 @@ jobs:
             if (-not $text.Contains("bk111/retain-pdf")) {
               throw "update-redirect probe (GITHUB_REPO=bk111/retain-pdf) missing in: $($b.FullName)"
             }
-            Write-Host "both frontend patch probes found in $($b.FullName)"
+            # 反向探针(补丁4b): 那句拦死提交的红字必须从产物里彻底消失
+            if ($text.Contains("无法确认 DeepSeek 余额")) {
+              throw "balance-unknown gate still present in: $($b.FullName)"
+            }
+            Write-Host "frontend patch probes OK (bootstrap + update-redirect + balance gate removed) in $($b.FullName)"
           }
           # 补丁3 探针: 打包进 app 的后端 python 必含目标语种 env 读取
           $ctxCopies = Get-ChildItem -Path . -Filter "session_context.py" -Recurse -File -ErrorAction SilentlyContinue |
