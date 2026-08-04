@@ -43,8 +43,11 @@ name: Build Portable (Windows)
         # lm10 起 = 译后文件名前缀跟随目标语种(上游硬编码 zh_, 见补丁10);
         # lm11 起 = 阿拉伯/泰语字体入包 + Typst 显式字体链(否则落系统 Tahoma/
         #           Times, 风格不搭且各机不一, 见补丁11) + 翻译缓存拒收 echo
-        #           条目(同语种守卫的逐字回写曾毒化缓存, 见补丁12)
-        default: "lm11"
+        #           条目(同语种守卫的逐字回写曾毒化缓存, 见补丁12);
+        # lm12 起 = DEFAULT_BASE_URL 常量改指我方代理(上游默认 DeepSeek 官方,
+        #           任何回退链走到它就把用户 JWT 发给第三方且译文全空, 见补丁13)
+        #           + 终局回收全军覆没时响亮失败(不许静默渲染原文, 见补丁14)
+        default: "lm12"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -595,6 +598,56 @@ jobs:
           $art = $art.Replace($anchor10b, $replace10.TrimEnd("`r", "`n", " ").TrimStart("`r", "`n"))
           Set-Content -Path $artPath -Value $art -Encoding utf8 -NoNewline
           Write-Host "artifacts.ts patched (language-aware translated pdf prefix)"
+
+          # --- 补丁13 (lm12): DEFAULT_BASE_URL 兜底改指我方代理 ---
+          # 2026-08-04 事故#3: 提交载荷 base_url 的回退链在多个语境下会落到
+          # 上游常量 DEFAULT_BASE_URL = api.deepseek.com/v1(浏览器侧存储没有
+          # baseUrl 字段, 设置对话框保存时还会把这个回退值**固化写入**
+          # developerConfig)。后果: 翻译请求带着我方 JWT 发给 DeepSeek 官方,
+          # 失败被上游静默吞掉, 译文全空、作业"成功"。words13 注入侧已钉
+          # developerConfig, 但设置面板一保存就复发 —— 治本必须改常量本身:
+          # 兜底永远指向我方代理, 与注入时机/用户操作无关。
+          $mc = "frontend/src/js/config/model-constants.ts"
+          $mct = Get-Content $mc -Raw -Encoding utf8
+          $anchor13 = 'export const DEFAULT_BASE_URL = "https://api.deepseek.com/v1";'
+          if ([regex]::Matches($mct, [regex]::Escape($anchor13)).Count -ne 1) { throw "anchor13 missing/dup in $mc" }
+          $mct = $mct.Replace($anchor13,
+            'export const DEFAULT_BASE_URL = "https://www.lingomaster.io/api/cloud/pdf-llm/v1"; // [lingomaster] lm12: 兜底指我方代理, 勿回退第三方')
+          Set-Content -Path $mc -Value $mct -Encoding utf8 -NoNewline
+          Write-Host "model-constants.ts patched (DEFAULT_BASE_URL -> lingomaster proxy)"
+
+          # --- 补丁14 (lm12): 终局回收全军覆没时响亮失败 ---
+          # untranslated.py 的设计宽容: 回收失败的块 mark_keep_origin 进
+          # dead letter, 作业照样成功 —— 单块奇葩失败该宽容, 但"全部尝试
+          # 全部失败"是端点不可达/凭据无效的系统性强信号, 静默成功的代价是
+          # 用户拿到原文、白扣 OCR 费、毫无报错(事故#3 的用户视角)。
+          # attempted>=3 才拦截: 1-2 块全灭仍走上游宽容, 避免小文档误伤。
+          $up = "backend/scripts/services/translation/services/finalization/untranslated.py"
+          $upt = Get-Content $up -Raw -Encoding utf8
+          if ($upt.Contains("[lingomaster]")) { throw "patch marker already present in $up" }
+          $anchor14 = "    after = blocking_untranslated_items(page_payloads)`n    return FinalUntranslatedRecoverySummary("
+          $anchor14crlf = $anchor14.Replace("`n", "`r`n")
+          $hit14 = $null
+          foreach ($cand in @($anchor14, $anchor14crlf)) {
+            if ([regex]::Matches($upt, [regex]::Escape($cand)).Count -eq 1) { $hit14 = $cand; break }
+          }
+          if (-not $hit14) { throw "anchor14 missing/dup in $up" }
+          $nl = if ($hit14 -eq $anchor14crlf) { "`r`n" } else { "`n" }
+          $insert14 = "    after = blocking_untranslated_items(page_payloads)$nl" +
+            "    # [lingomaster] lm12: 终局回收全军覆没 => 响亮失败, 不许静默渲染原文。$nl" +
+            "    # 2026-08-04 事故: base_url 落到第三方, 全部请求失败, 每块被$nl" +
+            "    # mark_keep_origin 吞进 dead letter, 作业照样'成功' —— 用户拿到$nl" +
+            "    # 原文还扣了 OCR 费。attempted>=3 才拦(单块奇葩失败走上游宽容)。$nl" +
+            "    if len(candidates) >= 3 and recovered == 0:$nl" +
+            "        raise RuntimeError($nl" +
+            "            'translation final recovery collapsed: '$nl" +
+            "            f'0/{len(candidates)} blocks recovered (dead_letter={dead_letter}); '$nl" +
+            "            f'LLM endpoint unreachable or credentials invalid (base_url={base_url})'$nl" +
+            "        )$nl" +
+            "    return FinalUntranslatedRecoverySummary("
+          $upt = $upt.Replace($hit14, $insert14)
+          Set-Content -Path $up -Value $upt -Encoding utf8 -NoNewline
+          Write-Host "untranslated.py patched (loud failure on total recovery collapse)"
 
           # --- 补丁11 (lm11): 阿拉伯/泰语字体入包 + Typst 显式字体链 ---
           # 实测(2026-08-04): 装船思源宋体无 ar/th 字形, Typst 会**自动回退到
@@ -1192,6 +1245,29 @@ jobs:
             }
             Write-Host "target-language probes found in $($c.FullName)"
           }
+          # 补丁13 探针: 产物 bundle 里第三方默认端点必须绝迹, 我方代理必须在场
+          $bundleBlobs = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Name -like "*.bundle.js" -or $_.Name -eq "app.asar") -and $_.FullName -notmatch "node_modules" }
+          if (-not $bundleBlobs) { throw "lm12: no built bundles found for probing" }
+          $badHits = 0; $goodHits = 0
+          foreach ($bb in $bundleBlobs) {
+            $raw = [System.IO.File]::ReadAllText($bb.FullName)
+            $badHits += ([regex]::Matches($raw, [regex]::Escape("api.deepseek.com"))).Count
+            $goodHits += ([regex]::Matches($raw, [regex]::Escape("lingomaster.io/api/cloud/pdf-llm"))).Count
+          }
+          if ($badHits -gt 0) { throw "lm12: api.deepseek.com still present in bundles ($badHits hits) - DEFAULT_BASE_URL patch did not take" }
+          if ($goodHits -lt 1) { throw "lm12: lingomaster proxy default absent from bundles" }
+          Write-Host "lm12 DEFAULT_BASE_URL probes OK (third-party endpoint eradicated, proxy default x$goodHits)"
+          # 补丁14 探针: 响亮失败在所有装船副本里
+          $upCopies = Get-ChildItem -Path . -Filter "untranslated.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "finalization" -and $_.FullName -notmatch "node_modules" }
+          if (-not $upCopies) { throw "lm12: finalization/untranslated.py not found" }
+          foreach ($uc in $upCopies) {
+            if (-not (Get-Content $uc.FullName -Raw -Encoding utf8).Contains("final recovery collapsed")) {
+              throw "lm12: loud-failure guard missing in $($uc.FullName)"
+            }
+          }
+          Write-Host "lm12 loud-failure probes OK"
           # 补丁11 探针: ar/th 字体确实装船 + 模板确实用了字体链
           $arFonts = Get-ChildItem -Path . -Filter "NotoNaskhArabic-Regular.ttf" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
