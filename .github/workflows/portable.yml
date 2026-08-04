@@ -607,14 +607,44 @@ jobs:
           # 失败被上游静默吞掉, 译文全空、作业"成功"。words13 注入侧已钉
           # developerConfig, 但设置面板一保存就复发 —— 治本必须改常量本身:
           # 兜底永远指向我方代理, 与注入时机/用户操作无关。
-          $mc = "frontend/src/js/config/model-constants.ts"
-          $mct = Get-Content $mc -Raw -Encoding utf8
-          $anchor13 = 'export const DEFAULT_BASE_URL = "https://api.deepseek.com/v1";'
-          if ([regex]::Matches($mct, [regex]::Escape($anchor13)).Count -ne 1) { throw "anchor13 missing/dup in $mc" }
-          $mct = $mct.Replace($anchor13,
-            'export const DEFAULT_BASE_URL = "https://www.lingomaster.io/api/cloud/pdf-llm/v1"; // [lingomaster] lm12: 兜底指我方代理, 勿回退第三方')
-          Set-Content -Path $mc -Value $mct -Encoding utf8 -NoNewline
-          Write-Host "model-constants.ts patched (DEFAULT_BASE_URL -> lingomaster proxy)"
+          # 首次构建实测: bundle 里 14 处命中, 源头不止前端常量一个 —— 桌面主
+          # 进程有同名默认值、prepare-app.mjs 还把 deepseek 写进**新装种子配置**
+          # (全新 %APPDATA% 也坏的另一半来源); python provider 兜底一并加固。
+          # 注意: client.py/aggregator.py 里 `"api.deepseek.com" in base` 是
+          # 端点探测**判断逻辑**, 必须保留 —— 所以替换只针对完整默认 URL 字面量。
+          $LM_PROXY = "https://www.lingomaster.io/api/cloud/pdf-llm/v1"
+          $DS_URL = "https://api.deepseek.com/v1"
+          $edits13 = @(
+            @{ File = "frontend/src/js/config/model-constants.ts";
+               Anchor = "export const DEFAULT_BASE_URL = `"$DS_URL`";";
+               Replace = "export const DEFAULT_BASE_URL = `"$LM_PROXY`"; // [lingomaster] lm12: 兜底指我方代理" },
+            @{ File = "desktop/src/main/desktop-config.js";
+               Anchor = "const DEFAULT_BASE_URL = `"$DS_URL`";";
+               Replace = "const DEFAULT_BASE_URL = `"$LM_PROXY`"; // [lingomaster] lm12" },
+            @{ File = "desktop/scripts/prepare-app.mjs";
+               Anchor = "baseUrl: `"$DS_URL`",";
+               Replace = "baseUrl: `"$LM_PROXY`", // [lingomaster] lm12: 新装种子配置不得指向第三方" },
+            @{ File = "backend/scripts/services/translation/llm/providers/deepseek/transport.py";
+               Anchor = "DEFAULT_BASE_URL = `"$DS_URL`"";
+               Replace = "DEFAULT_BASE_URL = `"$LM_PROXY`"  # [lingomaster] lm12" },
+            @{ File = "backend/scripts/services/translation/llm/providers/deepseek/client.py";
+               Anchor = "DEFAULT_BASE_URL = `"$DS_URL`"";
+               Replace = "DEFAULT_BASE_URL = `"$LM_PROXY`"  # [lingomaster] lm12" },
+            @{ File = "backend/ai_service/retainpdf_ai/config.py";
+               Anchor = "llm_base_url: str = `"$DS_URL`"";
+               Replace = "llm_base_url: str = `"$LM_PROXY`"  # [lingomaster] lm12" },
+            @{ File = "backend/ai_service/retainpdf_ai/config.py";
+               Anchor = "os.environ.get(`"RETAIN_AI_LLM_BASE_URL`", `"$DS_URL`")";
+               Replace = "os.environ.get(`"RETAIN_AI_LLM_BASE_URL`", `"$LM_PROXY`")" }
+          )
+          foreach ($e in $edits13) {
+            $raw = Get-Content $e.File -Raw -Encoding utf8
+            if ([regex]::Matches($raw, [regex]::Escape($e.Anchor)).Count -ne 1) {
+              throw "anchor13 missing/dup in $($e.File): $($e.Anchor)"
+            }
+            Set-Content -Path $e.File -Value ($raw.Replace($e.Anchor, $e.Replace)) -Encoding utf8 -NoNewline
+            Write-Host "default-endpoint pinned in $($e.File)"
+          }
 
           # --- 补丁14 (lm12): 终局回收全军覆没时响亮失败 ---
           # untranslated.py 的设计宽容: 回收失败的块 mark_keep_origin 进
@@ -1249,15 +1279,31 @@ jobs:
           $bundleBlobs = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { ($_.Name -like "*.bundle.js" -or $_.Name -eq "app.asar") -and $_.FullName -notmatch "node_modules" }
           if (-not $bundleBlobs) { throw "lm12: no built bundles found for probing" }
-          $badHits = 0; $goodHits = 0
+          # 断言目标 = **完整默认 URL** 零残留(判断逻辑用的裸域名合法保留,
+          # python 端 client.py:134/aggregator.py:22 的端点探测不在 bundle 内)
+          $badHits = 0; $goodHits = 0; $bareHits = 0
           foreach ($bb in $bundleBlobs) {
             $raw = [System.IO.File]::ReadAllText($bb.FullName)
-            $badHits += ([regex]::Matches($raw, [regex]::Escape("api.deepseek.com"))).Count
+            $badHits += ([regex]::Matches($raw, [regex]::Escape("https://api.deepseek.com/v1"))).Count
+            $bareHits += ([regex]::Matches($raw, [regex]::Escape("api.deepseek.com"))).Count
             $goodHits += ([regex]::Matches($raw, [regex]::Escape("lingomaster.io/api/cloud/pdf-llm"))).Count
           }
-          if ($badHits -gt 0) { throw "lm12: api.deepseek.com still present in bundles ($badHits hits) - DEFAULT_BASE_URL patch did not take" }
+          if ($badHits -gt 0) { throw "lm12: default DeepSeek URL still present in bundles ($badHits hits)" }
           if ($goodHits -lt 1) { throw "lm12: lingomaster proxy default absent from bundles" }
-          Write-Host "lm12 DEFAULT_BASE_URL probes OK (third-party endpoint eradicated, proxy default x$goodHits)"
+          Write-Host "lm12 DEFAULT_BASE_URL probes OK (full-URL eradicated, proxy x$goodHits, bare-domain refs x$bareHits informational)"
+          # 装船 python 副本: provider/ai_service 兜底也已指向代理
+          foreach ($pyRel in @("transport.py", "client.py")) {
+            $pyCopies = Get-ChildItem -Path . -Filter $pyRel -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "deepseek" -and $_.FullName -notmatch "node_modules" }
+            if (-not $pyCopies) { throw "lm12: deepseek provider $pyRel not found" }
+            foreach ($pc in $pyCopies) {
+              $pt = Get-Content $pc.FullName -Raw -Encoding utf8
+              if ($pt.Contains('DEFAULT_BASE_URL = "https://api.deepseek.com/v1"')) {
+                throw "lm12: provider default not pinned in $($pc.FullName)"
+              }
+            }
+          }
+          Write-Host "lm12 python provider fallback probes OK"
           # 补丁14 探针: 响亮失败在所有装船副本里
           $upCopies = Get-ChildItem -Path . -Filter "untranslated.py" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "finalization" -and $_.FullName -notmatch "node_modules" }
