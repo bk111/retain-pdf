@@ -40,8 +40,11 @@ name: Build Portable (Windows)
         # lm9 起 = 目标语种选择器进 设置→任务选项(plan R12, 见补丁8) + 补丁3 改为
         #          调用时解析 desktop-config(保存后下一单即生效) + 源=目标语种在
         #          翻译前拦截(见补丁9);
-        # lm10 起 = 译后文件名前缀跟随目标语种(上游硬编码 zh_, 见补丁10)
-        default: "lm10"
+        # lm10 起 = 译后文件名前缀跟随目标语种(上游硬编码 zh_, 见补丁10);
+        # lm11 起 = 阿拉伯/泰语字体入包 + Typst 显式字体链(否则落系统 Tahoma/
+        #           Times, 风格不搭且各机不一, 见补丁11) + 翻译缓存拒收 echo
+        #           条目(同语种守卫的逐字回写曾毒化缓存, 见补丁12)
+        default: "lm11"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -593,6 +596,185 @@ jobs:
           Set-Content -Path $artPath -Value $art -Encoding utf8 -NoNewline
           Write-Host "artifacts.ts patched (language-aware translated pdf prefix)"
 
+          # --- 补丁11 (lm11): 阿拉伯/泰语字体入包 + Typst 显式字体链 ---
+          # 实测(2026-08-04): 装船思源宋体无 ar/th 字形, Typst 会**自动回退到
+          # 系统字体** —— Windows 上阿文落 Tahoma、泰文落 Times New Roman,
+          # 可读但与宋体正文风格完全不搭, 且不同用户机系统字体不同 ⇒ 产物漂移;
+          # 精简系统/跨平台则直接豆腐块。TYPST_FONT_PATHS 环境变量**不解决**
+          # (实测: 候选池变大但选谁仍由 Typst 内部排序定, 系统字体照样胜出),
+          # 必须"字体入包 + 模板显式指定"两件一起做。
+          # 字体来源 Google Fonts(SIL OFL), 钉 SHA256 防供应链漂移。
+          $fontDirs = @("backend/fonts", "desktop/assets/fonts")
+          # Charis SIL: 语言学字体(SIL 出品), 补 **IPA 音标与连读标记** ——
+          # 2026-08-04 cmap 实测: 思源宋体**没有** ‿(U+203F)/⁀(U+2040) 与多数 IPA
+          # 符号(ə ɪ ʊ ʃ ʒ ŋ ɹ ː 等)。本产品是语言学习工具, 用户翻译发音教程/词典
+          # 时译文会带这些符号 —— 不入包就会落到系统字体(各机不同)或豆腐块。
+          $notoFonts = @(
+            @{ Name = "NotoNaskhArabic-Regular.ttf";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf";
+               Sha  = "67b5a525a661b607971fbd3f96a81b89d3a768e74534fca84f18ac97e6fab72f" },
+            @{ Name = "NotoSerifThai-Regular.ttf";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/notoserifthai/NotoSerifThai%5Bwdth,wght%5D.ttf";
+               Sha  = "34a7ad11647c845303aabdde639059806c56b84719e5d2ceb28eb038711bdf53" },
+            @{ Name = "CharisSIL-Regular.ttf";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/charissil/CharisSIL-Regular.ttf";
+               Sha  = "346337374aa347d64ee015b26d441f1970d8631914e2f3941b00e1c4761e28c5" }
+          )
+          $ofl = @(
+            @{ Name = "OFL-NotoNaskhArabic.txt";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/notonaskharabic/OFL.txt" },
+            @{ Name = "OFL-NotoSerifThai.txt";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/notoserifthai/OFL.txt" },
+            @{ Name = "OFL-CharisSIL.txt";
+               Url  = "https://raw.githubusercontent.com/google/fonts/main/ofl/charissil/OFL.txt" }
+          )
+          $stage = Join-Path $env:RUNNER_TEMP "lm11-fonts"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($f in $notoFonts) {
+            $tmp = Join-Path $stage $f.Name
+            Invoke-WebRequest -Uri $f.Url -OutFile $tmp
+            $got = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+            if ($f.Sha -notlike "PLACEHOLDER*" -and $got -ne $f.Sha) {
+              throw "font sha mismatch for $($f.Name): expected $($f.Sha) got $got"
+            }
+            Write-Host "font $($f.Name) sha256=$got size=$([math]::Round((Get-Item $tmp).Length/1KB))KB"
+            # 家族名断言: Typst 按 family name 匹配, 名字变了显式链就静默失效
+            foreach ($d in $fontDirs) {
+              if (Test-Path $d) { Copy-Item $tmp (Join-Path $d $f.Name) -Force }
+            }
+          }
+          foreach ($l in $ofl) {
+            $tmp = Join-Path $stage $l.Name
+            Invoke-WebRequest -Uri $l.Url -OutFile $tmp
+            foreach ($d in $fontDirs) {
+              if (Test-Path $d) { Copy-Item $tmp (Join-Path $d $l.Name) -Force }
+            }
+          }
+          Write-Host "lm11 fonts staged into: $($fontDirs -join ', ')"
+
+          # 11b: 字体链常量 —— 单一源头 (所有 #set text(font:...) 都取它)
+          $fontsPy = "backend/scripts/foundation/config/fonts.py"
+          $fp = Get-Content $fontsPy -Raw -Encoding utf8
+          if ($fp.Contains("[lingomaster]")) { throw "patch marker already present in $fontsPy" }
+          $anchor11b = 'TYPST_DEFAULT_FONT_FAMILY = os.environ.get("RETAIN_PDF_TYPST_FONT_FAMILY", "").strip() or "Source Han Serif SC"'
+          if ([regex]::Matches($fp, [regex]::Escape($anchor11b)).Count -ne 1) { throw "anchor11b missing/dup in $fontsPy" }
+          $insert11b = @'
+          TYPST_DEFAULT_FONT_FAMILY = os.environ.get("RETAIN_PDF_TYPST_FONT_FAMILY", "").strip() or "Source Han Serif SC"
+
+          # [lingomaster] lm11: 显式回退链。思源宋体缺三类字形, 不显式指定时
+          # Typst 会自动回退到**系统字体**(Windows 上阿文落 Tahoma、泰文落 Times
+          # New Roman) —— 风格与宋体正文不搭, 且各用户机/各语言版本 Windows 的
+          # 系统字体不同 ⇒ 同一文档在不同机器上产物不一致; 精简系统直接豆腐块。
+          # 显式列出后全部由装船字体接管, 渲染结果与机器无关。顺序即优先级。
+          #   Charis SIL       —— IPA 音标与连读标记 ‿ U+203F / ⁀ U+2040
+          #                       (实测思源宋体没有这些字形; 本产品是语言学习
+          #                        工具, 发音教程/词典类文档必然用到)
+          #   Noto Naskh Arabic—— 阿拉伯文
+          #   Noto Serif Thai  —— 泰文
+          TYPST_FALLBACK_FONT_FAMILIES = (
+              "Charis SIL",
+              "Noto Naskh Arabic",
+              "Noto Serif Thai",
+          )
+
+
+          def typst_font_stack_expr(primary: str = "") -> str:
+              """渲染成 Typst 的字体数组字面量: ("主字体", "回退1", "回退2")。"""
+              families = [str(primary or TYPST_DEFAULT_FONT_FAMILY).strip()]
+              for fam in TYPST_FALLBACK_FONT_FAMILIES:
+                  if fam not in families:
+                      families.append(fam)
+              inner = ", ".join('"' + f.replace('"', '\\"') + '"' for f in families)
+              return "(" + inner + ")"
+          '@
+          $fp = $fp.Replace($anchor11b, $insert11b.Trim())
+          Set-Content -Path $fontsPy -Value $fp -Encoding utf8 -NoNewline
+          Write-Host "fonts.py patched (explicit typst font stack)"
+
+          # 11c: 两处生产模板改用字体链 (devtools 页脚工具不动)
+          foreach ($tpl in @("backend/scripts/services/rendering/output/typst/emitter.py",
+                             "backend/scripts/services/rendering/output/typst/source_pages.py")) {
+            $t = Get-Content $tpl -Raw -Encoding utf8
+            $anchor11c = 'f''#set text(font: "{font_family}", size: {fonts.DEFAULT_FONT_SIZE}pt)'''
+            if ([regex]::Matches($t, [regex]::Escape($anchor11c)).Count -ne 1) {
+              throw "anchor11c missing/dup in $tpl"
+            }
+            $t = $t.Replace($anchor11c,
+              'f''#set text(font: {fonts.typst_font_stack_expr(font_family)}, size: {fonts.DEFAULT_FONT_SIZE}pt)''')
+            Set-Content -Path $tpl -Value $t -Encoding utf8 -NoNewline
+            Write-Host "font stack wired into $tpl"
+          }
+
+          # --- 补丁12 (lm11): 翻译缓存拒收 echo 条目 ---
+          # 2026-08-04 真实事故: 用户报"翻译没执行, 内容语种没变"。服务端证据 ——
+          # OCR 计费 3 次而 pdf_llm 调用 **0 次** ⇒ 翻译阶段全量命中本机缓存。
+          # 根因: lm5 时代做同语种实验时, 模型按提示词守卫"逐字输出原文", 那些
+          # **原文回写被当作合法译文写进了缓存**(键含 prompt_hash, lm5 起未变 ⇒
+          # 今天照样命中)。lm9 硬守卫堵住了新毒的主要产生面, 此补丁把缓存读写
+          # 两端都封死: 写入端不收 echo, 读取端让存量毒条目失效并自清。
+          # **decision == "keep_origin" 必须放行** —— 那是上游合法的"该条目无需
+          # 翻译"(纯数字/专有名词等), 译文==原文是正确结果, 拒了会破坏正常功能。
+          $cachePy = "backend/scripts/services/translation/llm/shared/cache.py"
+          $cp = Get-Content $cachePy -Raw -Encoding utf8
+          if ($cp.Contains("[lingomaster]")) { throw "patch marker already present in $cachePy" }
+          $anchor12a = "def _sanitize_cached_translation_text(text: str) -> tuple[str, bool]:"
+          if ([regex]::Matches($cp, [regex]::Escape($anchor12a)).Count -ne 1) { throw "anchor12a missing/dup in $cachePy" }
+          $insert12a = @'
+          def _lm_is_echo_translation(item: dict, decision: str, translated_text: str) -> bool:
+              """[lingomaster] lm11: 译文与原文逐字相同 = 同语种守卫的回写, 不是翻译。
+
+              只对 decision == "translate" 生效: keep_origin 本就意味着"原样保留",
+              译文==原文是正确结果。空白差异归一化后比较, 避免因换行/缩进漏判。
+              """
+              if str(decision or "").strip() != "translate":
+                  return False
+              translated = " ".join(str(translated_text or "").split())
+              if not translated:
+                  return False
+              source = " ".join(str(_unit_source_text(item) or "").split())
+              return bool(source) and translated == source
+
+
+          def _sanitize_cached_translation_text(text: str) -> tuple[str, bool]:
+          '@
+          $cp = $cp.Replace($anchor12a, $insert12a.Trim())
+          # 12b: 读取端 —— 存量毒条目视为未命中并删除(自清, 无需用户手动清缓存)
+          $anchor12b = @'
+              return {
+                  "decision": decision,
+                  "translated_text": translated_text,
+              }
+          '@
+          $anchor12bTrim = $anchor12b.TrimEnd("`r", "`n")
+          if ([regex]::Matches($cp, [regex]::Escape($anchor12bTrim)).Count -ne 1) { throw "anchor12b missing/dup in $cachePy" }
+          $insert12b = @'
+              if _lm_is_echo_translation(item, decision, translated_text):
+                  # [lingomaster] lm11: 存量 echo 毒条目 —— 当作未命中并就地删除,
+                  # 让本次真正走一次翻译(否则用户永远拿到原文, 且毫无报错)。
+                  try:
+                      path.unlink()
+                  except OSError:
+                      pass
+                  return {}
+              return {
+                  "decision": decision,
+                  "translated_text": translated_text,
+              }
+          '@
+          $cp = $cp.Replace($anchor12bTrim, $insert12b.TrimEnd("`r", "`n"))
+          # 12c: 写入端 —— 不让新的 echo 进缓存
+          $anchor12c = '    if not translated_text and decision != "keep_origin":' + "`r`n" + '        return'
+          $anchor12cAlt = '    if not translated_text and decision != "keep_origin":' + "`n" + '        return'
+          $pattern12c = [regex]::Escape('    if not translated_text and decision != "keep_origin":') + '\r?\n' + [regex]::Escape('        return')
+          if ([regex]::Matches($cp, $pattern12c).Count -ne 1) { throw "anchor12c missing/dup in $cachePy" }
+          $replace12c = '    if not translated_text and decision != "keep_origin":' + "`n" + '        return' + "`n" +
+                        '    if _lm_is_echo_translation(item, decision, translated_text):' + "`n" +
+                        '        # [lingomaster] lm11: 不把"逐字回写原文"存成译文, 防毒化后续作业' + "`n" +
+                        '        return'
+          $cp = [regex]::Replace($cp, $pattern12c, $replace12c)
+          Set-Content -Path $cachePy -Value $cp -Encoding utf8 -NoNewline
+          Write-Host "cache.py patched (echo entries rejected on both read and write)"
+
           # --- 补丁9 (lm9, plan R12): 源=目标语种在翻译前拦截 ---
           # 落点 execution_plan: OCR JSON 已加载(扫描版也有文本, 判别最可靠),
           # 且在 sci domain 推断(会打 LLM)与翻译编排之前 —— 拦下即省整笔 LLM 费。
@@ -1010,6 +1192,55 @@ jobs:
             }
             Write-Host "target-language probes found in $($c.FullName)"
           }
+          # 补丁11 探针: ar/th 字体确实装船 + 模板确实用了字体链
+          $arFonts = Get-ChildItem -Path . -Filter "NotoNaskhArabic-Regular.ttf" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          $thFonts = Get-ChildItem -Path . -Filter "NotoSerifThai-Regular.ttf" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          $ipaFonts = Get-ChildItem -Path . -Filter "CharisSIL-Regular.ttf" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "node_modules" }
+          if (-not $arFonts) { throw "lm11: NotoNaskhArabic not shipped" }
+          if (-not $thFonts) { throw "lm11: NotoSerifThai not shipped" }
+          if (-not $ipaFonts) { throw "lm11: CharisSIL (IPA/liaison) not shipped" }
+          Write-Host "lm11 fonts shipped: arabic x$($arFonts.Count), thai x$($thFonts.Count), ipa x$($ipaFonts.Count)"
+          $stackCopies = Get-ChildItem -Path . -Filter "fonts.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "foundation" -and $_.FullName -notmatch "node_modules" }
+          if (-not $stackCopies) { throw "lm11: foundation/config/fonts.py not found" }
+          foreach ($sc in $stackCopies) {
+            if (-not (Get-Content $sc.FullName -Raw -Encoding utf8).Contains("typst_font_stack_expr")) {
+              throw "lm11: font stack helper missing in $($sc.FullName)"
+            }
+          }
+          foreach ($tplName in @("emitter.py", "source_pages.py")) {
+            $tplCopies = Get-ChildItem -Path . -Filter $tplName -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "typst" -and $_.FullName -notmatch "node_modules" }
+            if (-not $tplCopies) { throw "lm11: $tplName not found" }
+            foreach ($tc in $tplCopies) {
+              $tt = Get-Content $tc.FullName -Raw -Encoding utf8
+              if (-not $tt.Contains("typst_font_stack_expr(font_family)")) {
+                throw "lm11: $tplName does not use the font stack: $($tc.FullName)"
+              }
+              # 反向: 写死单字体的旧写法必须消失
+              if ($tt.Contains('font: "{font_family}"')) {
+                throw "lm11: single-font template still present in $($tc.FullName)"
+              }
+            }
+          }
+          Write-Host "lm11 font-stack probes OK"
+          # 补丁12 探针: 缓存 echo 拒收在读写两端
+          $cacheCopies = Get-ChildItem -Path . -Filter "cache.py" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "llm.shared" -and $_.FullName -notmatch "node_modules" }
+          if (-not $cacheCopies) { throw "lm11: translation cache.py not found" }
+          foreach ($cc in $cacheCopies) {
+            $ct = Get-Content $cc.FullName -Raw -Encoding utf8
+            if (-not $ct.Contains("_lm_is_echo_translation")) {
+              throw "lm11: echo guard missing in $($cc.FullName)"
+            }
+            if (([regex]::Matches($ct, [regex]::Escape("_lm_is_echo_translation(item, decision"))).Count -lt 2) {
+              throw "lm11: echo guard must be wired on BOTH read and write paths in $($cc.FullName)"
+            }
+          }
+          Write-Host "lm11 cache echo-guard probes OK"
           # 补丁9 探针: 同语种守卫文件在船上, 且 execution_plan 完成接线
           $guardCopies = Get-ChildItem -Path . -Filter "lm_language_guard.py" -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch "node_modules" }
