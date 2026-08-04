@@ -655,6 +655,29 @@ jobs:
             Write-Host "default-endpoint pinned in $($e.File)"
           }
 
+          # 13b: 前端 tests/ 与 scripts/ 不装船 —— 三建实测最后 6 处完整 URL
+          # 全来自 asar 里的前端测试文件(workflow-payload.test.mjs x4 +
+          # reader.test.mjs x2)。修包不修测试: 测试断言的上游默认值是上游
+          # 测试意图, 不动; 冒烟/测试在构建期用的是源树(--prefix ../frontend),
+          # 排除装船拷贝不影响构建验证。LF/CRLF 双候选(runner git 可能转换)。
+          $pa = "desktop/scripts/prepare-app.mjs"
+          $pat = Get-Content $pa -Raw -Encoding utf8
+          $anchor13bLf = "const excludedFrontendEntries = new Set([`n  `"node_modules`","
+          $anchor13bCrlf = $anchor13bLf.Replace("`n", "`r`n")
+          $hit13b = $null
+          foreach ($cand in @($anchor13bLf, $anchor13bCrlf)) {
+            if ([regex]::Matches($pat, [regex]::Escape($cand)).Count -eq 1) { $hit13b = $cand; break }
+          }
+          if (-not $hit13b) { throw "anchor13b missing/dup in $pa" }
+          $nl13b = if ($hit13b -eq $anchor13bCrlf) { "`r`n" } else { "`n" }
+          $insert13b = "const excludedFrontendEntries = new Set([$nl13b" +
+            "  `"tests`", // [lingomaster] lm12: 测试与开发脚本不装船$nl13b" +
+            "  `"scripts`",$nl13b" +
+            "  `"node_modules`","
+          $pat = $pat.Replace($hit13b, $insert13b)
+          Set-Content -Path $pa -Value $pat -Encoding utf8 -NoNewline
+          Write-Host "prepare-app.mjs patched (frontend tests/scripts excluded from shipping)"
+
           # --- 补丁14 (lm12): 终局回收全军覆没时响亮失败 ---
           # untranslated.py 的设计宽容: 回收失败的块 mark_keep_origin 进
           # dead letter, 作业照样成功 —— 单块奇葩失败该宽容, 但"全部尝试
