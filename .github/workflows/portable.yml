@@ -635,7 +635,16 @@ jobs:
                Replace = "llm_base_url: str = `"$LM_PROXY`"  # [lingomaster] lm12" },
             @{ File = "backend/ai_service/retainpdf_ai/config.py";
                Anchor = "os.environ.get(`"RETAIN_AI_LLM_BASE_URL`", `"$DS_URL`")";
-               Replace = "os.environ.get(`"RETAIN_AI_LLM_BASE_URL`", `"$LM_PROXY`")" }
+               Replace = "os.environ.get(`"RETAIN_AI_LLM_BASE_URL`", `"$LM_PROXY`")" },
+            # 二建实测抓出的**真源头**: runtime-config.js 是随包分发的运行时
+            # 配置(runtimeConfig 第一优先级), 它显式配置 deepseek —— 常量兜底
+            # 根本轮不到就被它截胡; example 一并换, 防用户复制启用带毒。
+            @{ File = "frontend/runtime-config.js";
+               Anchor = "baseUrl: `"$DS_URL`",";
+               Replace = "baseUrl: `"$LM_PROXY`", // [lingomaster] lm12" },
+            @{ File = "frontend/runtime-config.local.example.js";
+               Anchor = "baseUrl: `"$DS_URL`",";
+               Replace = "baseUrl: `"$LM_PROXY`", // [lingomaster] lm12" }
           )
           foreach ($e in $edits13) {
             $raw = Get-Content $e.File -Raw -Encoding utf8
