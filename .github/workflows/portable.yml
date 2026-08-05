@@ -1603,9 +1603,10 @@ jobs:
             Where-Object { $_.FullName -match "backend[\\/]scripts" -and $_.Name -in @("devtools", "tests") }
           if ($unpackedDevtools) { throw "lm13: devtools/tests leaked into win-unpacked backend/scripts" }
           Write-Host "lm13 slim-ship probes OK"
-          # 补丁17 探针: rust 自愈两端都在(编译通过本身就是最强探针)
-          $rsCopies = Get-ChildItem -Path . -Filter "documents.rs" -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "rust_api" -and $_.FullName -notmatch "node_modules" }
+          # 补丁17 探针: rust 自愈两端都在(编译通过本身就是最强探针)。
+          # 范围限定源码树 —— 全树扫描会把 cargo target/ 里依赖 crate 的
+          # 同名文件卷进来(lm13 首建实测误报)。
+          $rsCopies = Get-ChildItem -Path "backend/rust_api/src" -Filter "documents.rs" -Recurse -File -ErrorAction SilentlyContinue
           if (-not $rsCopies) { throw "lm13: documents.rs not found" }
           foreach ($rc in $rsCopies) {
             $rt = Get-Content $rc.FullName -Raw -Encoding utf8
