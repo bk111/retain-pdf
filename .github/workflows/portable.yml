@@ -864,7 +864,12 @@ jobs:
             "            }$nl17" +
             "        }")
           Set-Content -Path $docRs -Value $dr -Encoding utf8 -NoNewline
-          Write-Host "documents.rs patched (search-time FTS self-heal)"
+          # 写后立刻回读断言(lm13 二建诊断: patched 输出打了, verify 却说标记
+          # 不在 —— 三点采样定位是"没写进去"还是"中途被覆盖")
+          $chk17 = Get-Content $docRs -Raw -Encoding utf8
+          $chk17n = ([regex]::Matches($chk17, "ensure_document_fts")).Count
+          if ($chk17n -lt 2) { throw "post-write readback FAILED: ensure_document_fts x$chk17n in $docRs" }
+          Write-Host "documents.rs patched (search-time FTS self-heal); readback x$chk17n refs, $((Get-Item $docRs).Length) bytes"
 
           # --- 补丁13 (lm12): DEFAULT_BASE_URL 兜底改指我方代理 ---
           # 2026-08-04 事故#3: 提交载荷 base_url 的回退链在多个语境下会落到
@@ -1387,7 +1392,17 @@ jobs:
       - name: Build Rust API for Windows
         if: steps.version.outputs.skip != 'true'
         shell: pwsh
-        run: cargo build --release --target x86_64-pc-windows-msvc --manifest-path backend/rust_api/Cargo.toml
+        run: |
+          # lm13 诊断采样点2: 编译前源文件必须仍含补丁(若此处失败 = 补丁 step
+          # 与本 step 之间有东西覆盖了 rust 源)
+          if ("${{ steps.version.outputs.suffix }}" -ne "") {
+            $pre = Get-Content backend/rust_api/src/db/documents.rs -Raw -Encoding utf8
+            $preN = ([regex]::Matches($pre, "ensure_document_fts")).Count
+            Write-Host "pre-cargo probe: ensure_document_fts x$preN, $((Get-Item backend/rust_api/src/db/documents.rs).Length) bytes"
+            if ($preN -lt 2) { throw "rust patch lost before cargo build (x$preN)" }
+          }
+          cargo build --release --target x86_64-pc-windows-msvc --manifest-path backend/rust_api/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
       - name: Assemble bundled Typst runtime
         if: steps.version.outputs.skip != 'true'
