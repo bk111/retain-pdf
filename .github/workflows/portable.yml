@@ -46,8 +46,12 @@ name: Build Portable (Windows)
         #           条目(同语种守卫的逐字回写曾毒化缓存, 见补丁12);
         # lm12 起 = DEFAULT_BASE_URL 常量改指我方代理(上游默认 DeepSeek 官方,
         #           任何回退链走到它就把用户 JWT 发给第三方且译文全空, 见补丁13)
-        #           + 终局回收全军覆没时响亮失败(不许静默渲染原文, 见补丁14)
-        default: "lm12"
+        #           + 终局回收全军覆没时响亮失败(不许静默渲染原文, 见补丁14);
+        # lm13 起 = AI 问答余额角标(代理结算头经 ai_service 透传为 lm_billing
+        #           SSE 事件, 前端 fetch-tee 监听, 见补丁15) + backend 剔除
+        #           devtools/tests 不装船(见补丁16) + 带 doc 过滤检索 0 行时
+        #           rust 现场回填 FTS(免重启自愈, 见补丁17)
+        default: "lm13"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -130,6 +134,7 @@ jobs:
           // 作业提交缺 provider token。参见 fork portable.yml 的补丁步骤说明。
           import { isDesktopMode as lmIsDesktopMode, loadPersistedConfig as lmLoadPersistedConfig } from "../../js/config/desktop-persistence.js";
           import { applyDefaultCredentialInputs as lmApplyDefaultCredentialInputs } from "../../js/features/credentials/default-state-port.js";
+          import "../../js/config/lm-balance-badge.js"; // [lingomaster] lm13: AI 问答余额角标(fetch-tee 监听 lm_billing 事件)
 
           if (lmIsDesktopMode()) {
             void (async () => {
@@ -598,6 +603,268 @@ jobs:
           $art = $art.Replace($anchor10b, $replace10.TrimEnd("`r", "`n", " ").TrimStart("`r", "`n"))
           Set-Content -Path $artPath -Value $art -Encoding utf8 -NoNewline
           Write-Host "artifacts.ts patched (language-aware translated pdf prefix)"
+
+          # --- 补丁15 (lm13): AI 问答计费透传 (代理结算头 -> lm_billing SSE 事件) ---
+          # 链路: 我方 pdf-llm 代理在 chat/completions 结算后带 X-LM-Charged/
+          # X-LM-Balance 响应头(server 已上线) -> ai_service 每次 LLM 调用读头
+          # 经 on_billing 回调 -> app.py SSE 路径推 {"type":"lm_billing"} 事件
+          # -> 前端角标(补丁15c) fetch-tee 监听展示。学生用户对余额敏感, 此前
+          # 每轮问答扣 1-6 credits 但 UI 全程无感。
+          $agentPy = "backend/ai_service/retainpdf_ai/agent.py"
+          $ag = Get-Content $agentPy -Raw -Encoding utf8
+          if ($ag.Contains("[lingomaster]")) { throw "patch marker already present in $agentPy" }
+          # 多行锚点一律拼接式书写: 直书多行会让续行缩进低于 YAML block scalar
+          # 基准, YAML 在那里静默截断整个 step(lm13 干跑实测踩到)。
+          $LF = "`n"
+          $anchor15sig = ("def build_deepseek_chat_fn($LF" +
+            "    settings: Settings,$LF" +
+            "    client: httpx.Client | None = None,$LF" +
+            "    *,$LF" +
+            "    on_delta: Callable[[str], None] | None = None,$LF" +
+            ") -> ChatFn:")
+          $anchor15sigCrlf = $anchor15sig.Replace("`n", "`r`n")
+          $hit15 = $null
+          foreach ($cand in @($anchor15sig, $anchor15sigCrlf)) {
+            if ([regex]::Matches($ag, [regex]::Escape($cand)).Count -eq 1) { $hit15 = $cand; break }
+          }
+          if (-not $hit15) { throw "anchor15sig missing/dup in $agentPy" }
+          $nl15 = if ($hit15 -eq $anchor15sigCrlf) { "`r`n" } else { "`n" }
+          $insert15sig = ("def _lm_emit_billing(response, on_billing) -> None:$nl15" +
+            "    # [lingomaster] lm13: 读我方代理的结算头, 失败静默(计费展示是增强不是功能)$nl15" +
+            "    if on_billing is None:$nl15" +
+            "        return$nl15" +
+            "    charged = response.headers.get(`"x-lm-charged`")$nl15" +
+            "    balance = response.headers.get(`"x-lm-balance`")$nl15" +
+            "    if charged is None and balance is None:$nl15" +
+            "        return$nl15" +
+            "    try:$nl15" +
+            "        on_billing(charged, balance)$nl15" +
+            "    except Exception:$nl15" +
+            "        pass$nl15" +
+            "$nl15" +
+            "$nl15" +
+            "def build_deepseek_chat_fn($nl15" +
+            "    settings: Settings,$nl15" +
+            "    client: httpx.Client | None = None,$nl15" +
+            "    *,$nl15" +
+            "    on_delta: Callable[[str], None] | None = None,$nl15" +
+            "    on_billing: Callable[[str | None, str | None], None] | None = None,  # [lingomaster] lm13$nl15" +
+            ") -> ChatFn:")
+          $ag = $ag.Replace($hit15, $insert15sig)
+          $anchor15a = ('raise _friendly_llm_error(response.status_code, response.text)' + $LF +
+            '            return response.json()["choices"][0]["message"]')
+          $anchor15aCrlf = $anchor15a.Replace("`n", "`r`n")
+          $hit15a = $null
+          foreach ($cand in @($anchor15a, $anchor15aCrlf)) {
+            if ([regex]::Matches($ag, [regex]::Escape($cand)).Count -eq 1) { $hit15a = $cand; break }
+          }
+          if (-not $hit15a) { throw "anchor15a missing/dup in $agentPy" }
+          $nl15a = if ($hit15a -eq $anchor15aCrlf) { "`r`n" } else { "`n" }
+          $ag = $ag.Replace($hit15a,
+            "raise _friendly_llm_error(response.status_code, response.text)$nl15a" +
+            "            _lm_emit_billing(response, on_billing)  # [lingomaster] lm13$nl15a" +
+            '            return response.json()["choices"][0]["message"]')
+          $anchor15b = "return assemble_streaming_message(response.iter_lines(), on_delta)"
+          if ([regex]::Matches($ag, [regex]::Escape($anchor15b)).Count -ne 1) { throw "anchor15b missing/dup in $agentPy" }
+          $ag = $ag.Replace($anchor15b,
+            "_lm_emit_billing(response, on_billing)  # [lingomaster] lm13: 流式头在连接建立即有$nl15a" +
+            "            return assemble_streaming_message(response.iter_lines(), on_delta)")
+          Set-Content -Path $agentPy -Value $ag -Encoding utf8 -NoNewline
+          Write-Host "agent.py patched (billing header passthrough via on_billing)"
+
+          $appPy = "backend/ai_service/retainpdf_ai/app.py"
+          $ap = Get-Content $appPy -Raw -Encoding utf8
+          if ($ap.Contains("[lingomaster]")) { throw "patch marker already present in $appPy" }
+          $anchor15c = 'on_delta=lambda text: events.put({"type": "answer_delta", "text": text}),'
+          if ([regex]::Matches($ap, [regex]::Escape($anchor15c)).Count -ne 1) { throw "anchor15c missing/dup in $appPy" }
+          $ap = $ap.Replace($anchor15c,
+            'on_delta=lambda text: events.put({"type": "answer_delta", "text": text}),' + "$nl15a" +
+            '            # [lingomaster] lm13: 代理结算头 -> SSE 事件, 前端余额角标消费' + "$nl15a" +
+            '            on_billing=lambda charged, balance: events.put(' + "$nl15a" +
+            '                {"type": "lm_billing", "charged": charged, "balance": balance}),')
+          Set-Content -Path $appPy -Value $ap -Encoding utf8 -NoNewline
+          Write-Host "app.py patched (lm_billing SSE event)"
+
+          # --- 补丁15c (lm13): 前端余额角标文件 ---
+          # 挂载 = 补丁1 的 entry.tsx bootstrap import(我们自己的锚点, 上游零依赖);
+          # 数据 = fetch-tee /v1/ask 的 SSE 流, 解析 lm_billing 事件。
+          $badgePath = "frontend/src/js/config/lm-balance-badge.js"
+          $badgeJs = @'
+          // [lingomaster] lm13 lm-balance-badge: AI QA credits badge.
+          // Listens to /v1/ask SSE via fetch tee; renders a fixed badge with the
+          // balance from our proxy settlement headers (passed through ai_service
+          // as {"type":"lm_billing"} events). Zero upstream anchors by design.
+          (function () {
+            if (typeof window === "undefined" || window.__lmBalanceBadge) { return; }
+            window.__lmBalanceBadge = true;
+            var badge = null;
+            var hideTimer = null;
+            function ensureBadge() {
+              if (badge && badge.isConnected) { return badge; }
+              badge = document.createElement("div");
+              badge.id = "lm-balance-badge";
+              badge.style.cssText =
+                "position:fixed;right:24px;bottom:96px;z-index:2147483000;" +
+                "background:rgba(30,41,59,.92);color:#fff;padding:6px 12px;" +
+                "border-radius:16px;font-size:12px;line-height:1.5;" +
+                "font-family:system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.25);" +
+                "pointer-events:none;display:none;";
+              (document.body || document.documentElement).appendChild(badge);
+              return badge;
+            }
+            function show(charged, balance) {
+              var el = ensureBadge();
+              var hasBalance = balance !== null && balance !== undefined && balance !== "";
+              var hasCharge = charged !== null && charged !== undefined && charged !== "" && Number(charged) > 0;
+              var parts = [];
+              if (hasBalance) { parts.push("余额 " + balance); }
+              if (hasCharge) { parts.push("本轮 -" + charged); }
+              if (!parts.length) { return; }
+              el.textContent = parts.join(" · ");
+              el.style.display = "block";
+              if (hideTimer) { clearTimeout(hideTimer); }
+              hideTimer = setTimeout(function () {
+                if (hasBalance) { el.textContent = "余额 " + balance; }
+              }, 6000);
+            }
+            var origFetch = window.fetch;
+            if (!origFetch) { return; }
+            window.fetch = function (input) {
+              var url = "";
+              try { url = typeof input === "string" ? input : ((input && input.url) || ""); } catch (e) { url = ""; }
+              var pending = origFetch.apply(this, arguments);
+              if (url.indexOf("/v1/ask") === -1) { return pending; }
+              return pending.then(function (resp) {
+                try {
+                  if (!resp || !resp.body || typeof resp.body.tee !== "function") { return resp; }
+                  var pair = resp.body.tee();
+                  var reader = pair[1].getReader();
+                  var decoder = new TextDecoder("utf-8");
+                  var buffer = "";
+                  (function pump() {
+                    reader.read().then(function (r) {
+                      if (r.done) { return; }
+                      buffer += decoder.decode(r.value, { stream: true });
+                      var nl;
+                      while ((nl = buffer.indexOf("\n")) >= 0) {
+                        var line = buffer.slice(0, nl).trim();
+                        buffer = buffer.slice(nl + 1);
+                        if (line.indexOf("data:") === 0) {
+                          try {
+                            var evt = JSON.parse(line.slice(5));
+                            if (evt && evt.type === "lm_billing") { show(evt.charged, evt.balance); }
+                          } catch (e) { /* non-JSON keepalive lines are fine */ }
+                        }
+                      }
+                      pump();
+                    }).catch(function () { /* mirror errors must never break the app */ });
+                  })();
+                  return new Response(pair[0], {
+                    status: resp.status,
+                    statusText: resp.statusText,
+                    headers: resp.headers,
+                  });
+                } catch (e) {
+                  return resp;
+                }
+              });
+            };
+          })();
+          '@
+          $badgeLines = $badgeJs -split "`r?`n" | ForEach-Object { $_ -replace '^          ', '' }
+          Set-Content -Path $badgePath -Value ($badgeLines -join "`n") -Encoding utf8 -NoNewline
+          Write-Host "created $badgePath"
+
+          # --- 补丁16 (lm13): backend/scripts 剔除 devtools/tests 不装船 ---
+          # devtools 的 import 全在其内部(生产代码零依赖, 已核查); ai_service
+          # 的复制本就有同款 tests 过滤(上游先例)。剔除后装船包更小, 且上游
+          # devtools/tests 里残留的第三方端点字面量(lm12 探针容忍的 111 处)
+          # 一并出船。
+          $paMjs = "desktop/scripts/prepare-app.mjs"
+          $pam = Get-Content $paMjs -Raw -Encoding utf8
+          $anchor16 = ('fs.cpSync(path.join(backendRoot, "scripts"), path.join(outputBackendRoot, "scripts"), {' + $LF +
+            '    recursive: true,' + $LF +
+            '    force: true,' + $LF +
+            '  });')
+          $anchor16Crlf = $anchor16.Replace("`n", "`r`n")
+          $hit16 = $null
+          foreach ($cand in @($anchor16, $anchor16Crlf)) {
+            if ([regex]::Matches($pam, [regex]::Escape($cand)).Count -eq 1) { $hit16 = $cand; break }
+          }
+          if (-not $hit16) { throw "anchor16 missing/dup in $paMjs" }
+          $nl16 = if ($hit16 -eq $anchor16Crlf) { "`r`n" } else { "`n" }
+          $insert16 = ('fs.cpSync(path.join(backendRoot, "scripts"), path.join(outputBackendRoot, "scripts"), {' + $nl16 +
+            '    recursive: true,' + $nl16 +
+            '    force: true,' + $nl16 +
+            '    // [lingomaster] lm13: 开发工具与测试不装船(生产代码零依赖, 已核查)' + $nl16 +
+            '    filter: (sourcePath) => {' + $nl16 +
+            '      const base = path.basename(sourcePath);' + $nl16 +
+            '      return base !== "__pycache__" && base !== ".pytest_cache"' + $nl16 +
+            '        && base !== "tests" && base !== "devtools";' + $nl16 +
+            '    },' + $nl16 +
+            '  });')
+          $pam = $pam.Replace($hit16, $insert16)
+          Set-Content -Path $paMjs -Value $pam -Encoding utf8 -NoNewline
+          Write-Host "prepare-app.mjs patched (backend devtools/tests excluded)"
+
+          # --- 补丁17 (lm13): 带 doc 过滤检索 0 行时现场回填 FTS ---
+          # 2026-08-05 实测: 作业终态钩子建索引失败被"尽力而为"吞掉后, 唯一
+          # 自愈是重启时 backfill —— 用户被迫重启才能让 AI 问答搜到新书。
+          # 检索入口自愈: doc 有 active_job 却无任何 FTS 行 => 现场回填再查。
+          # 幂等、只在缺口时做事, 全库检索(无 doc 过滤)不触发。
+          $docRs = "backend/rust_api/src/db/documents.rs"
+          $dr = Get-Content $docRs -Raw -Encoding utf8
+          if ($dr.Contains("[lingomaster]")) { throw "patch marker already present in $docRs" }
+          $anchor17fn = "    /// 全文检索。trigram 分词要求查询 ≥3 字符,更短的查询回退 LIKE 扫描。"
+          if ([regex]::Matches($dr, [regex]::Escape($anchor17fn)).Count -ne 1) { throw "anchor17fn missing/dup in $docRs" }
+          $nl17 = "`n"
+          if ($dr.Contains("`r`n")) { $nl17 = "`r`n" }
+          $insert17fn = ("    /// [lingomaster] lm13: 检索前自愈 —— 文档有 active_job 却无任何 FTS 行时$nl17" +
+            "    /// 现场回填。终态钩子失败/进程中断会留下这种状态, 此前只有重启时的$nl17" +
+            "    /// backfill_fts_indexes 能救(2026-08-05 实测用户被迫重启)。幂等且只在$nl17" +
+            "    /// 缺口时做事; 失败只记日志, 不影响检索本身返回空。$nl17" +
+            "    pub fn ensure_document_fts(&self, document_id: &str) -> Result<()> {$nl17" +
+            "        let (has_rows, active_job): (bool, Option<String>) = {$nl17" +
+            "            let conn = self.connect()?;$nl17" +
+            "            let has = conn.query_row($nl17" +
+            "                `"SELECT EXISTS(SELECT 1 FROM blocks_fts WHERE document_id = ?1)`",$nl17" +
+            "                params![document_id],$nl17" +
+            "                |row| row.get::<_, i64>(0),$nl17" +
+            "            )? != 0;$nl17" +
+            "            let job: Option<String> = conn$nl17" +
+            "                .query_row($nl17" +
+            "                    `"SELECT active_job_id FROM documents WHERE document_id = ?1`",$nl17" +
+            "                    params![document_id],$nl17" +
+            "                    |row| row.get::<_, Option<String>>(0),$nl17" +
+            "                )$nl17" +
+            "                .unwrap_or(None);$nl17" +
+            "            (has, job)$nl17" +
+            "        };$nl17" +
+            "        if has_rows {$nl17" +
+            "            return Ok(());$nl17" +
+            "        }$nl17" +
+            "        let Some(job_id) = active_job.filter(|j| !j.is_empty()) else {$nl17" +
+            "            return Ok(());$nl17" +
+            "        };$nl17" +
+            "        let job_root = self.data_root.join(`"jobs`").join(&job_id);$nl17" +
+            "        let rows = build_fts_rows_from_job_dir(&job_root)?;$nl17" +
+            "        self.replace_document_fts(document_id, &job_id, &rows)$nl17" +
+            "    }$nl17" +
+            "$nl17" +
+            "    /// 全文检索。trigram 分词要求查询 ≥3 字符,更短的查询回退 LIKE 扫描。")
+          $dr = $dr.Replace($anchor17fn, $insert17fn)
+          $anchor17call = "        let doc_filter = document_id.map(str::trim).filter(|s| !s.is_empty());"
+          if ([regex]::Matches($dr, [regex]::Escape($anchor17call)).Count -ne 1) { throw "anchor17call missing/dup in $docRs" }
+          $dr = $dr.Replace($anchor17call,
+            "        let doc_filter = document_id.map(str::trim).filter(|s| !s.is_empty());$nl17" +
+            "        // [lingomaster] lm13: 带 doc 过滤先自愈缺失索引(见 ensure_document_fts)$nl17" +
+            "        if let Some(doc_id) = doc_filter {$nl17" +
+            "            if let Err(error) = self.ensure_document_fts(doc_id) {$nl17" +
+            "                eprintln!(`"[library] fts self-heal skipped for {doc_id}: {error}`");$nl17" +
+            "            }$nl17" +
+            "        }")
+          Set-Content -Path $docRs -Value $dr -Encoding utf8 -NoNewline
+          Write-Host "documents.rs patched (search-time FTS self-heal)"
 
           # --- 补丁13 (lm12): DEFAULT_BASE_URL 兜底改指我方代理 ---
           # 2026-08-04 事故#3: 提交载荷 base_url 的回退链在多个语境下会落到
@@ -1307,6 +1574,47 @@ jobs:
             }
             Write-Host "target-language probes found in $($c.FullName)"
           }
+          # 补丁15/15c 探针: 角标进 bundle + ai_service 透传两端在船
+          $badgeHits = 0
+          foreach ($bb in (Get-ChildItem -Path . -Filter "*.bundle.js" -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch "node_modules" })) {
+            $badgeHits += ([regex]::Matches([System.IO.File]::ReadAllText($bb.FullName),
+              [regex]::Escape("lm-balance-badge"))).Count
+          }
+          if ($badgeHits -lt 1) { throw "lm13: balance badge missing from built bundles" }
+          Write-Host "lm13 badge probes OK (x$badgeHits)"
+          foreach ($pyPair in @(@("agent.py", "_lm_emit_billing"), @("app.py", "lm_billing"))) {
+            $pyName = $pyPair[0]; $pyMark = $pyPair[1]
+            $pyCopies = Get-ChildItem -Path . -Filter $pyName -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "retainpdf_ai" -and $_.FullName -notmatch "node_modules" }
+            if (-not $pyCopies) { throw "lm13: retainpdf_ai/$pyName not found" }
+            foreach ($pc in $pyCopies) {
+              if (-not (Get-Content $pc.FullName -Raw -Encoding utf8).Contains($pyMark)) {
+                throw "lm13: $pyMark missing in $($pc.FullName)"
+              }
+            }
+          }
+          Write-Host "lm13 billing passthrough probes OK"
+          # 补丁16 探针: devtools/tests 不得进装船 scripts(源树自身除外)
+          $shippedDevtools = Get-ChildItem -Path "desktop/app/backend/scripts" -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @("devtools", "tests") }
+          if ($shippedDevtools) { throw "lm13: devtools/tests still shipped under desktop/app/backend/scripts" }
+          $unpackedDevtools = Get-ChildItem -Path "desktop/win" -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "backend[\\/]scripts" -and $_.Name -in @("devtools", "tests") }
+          if ($unpackedDevtools) { throw "lm13: devtools/tests leaked into win-unpacked backend/scripts" }
+          Write-Host "lm13 slim-ship probes OK"
+          # 补丁17 探针: rust 自愈两端都在(编译通过本身就是最强探针)
+          $rsCopies = Get-ChildItem -Path . -Filter "documents.rs" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "rust_api" -and $_.FullName -notmatch "node_modules" }
+          if (-not $rsCopies) { throw "lm13: documents.rs not found" }
+          foreach ($rc in $rsCopies) {
+            $rt = Get-Content $rc.FullName -Raw -Encoding utf8
+            if (-not $rt.Contains("ensure_document_fts")) { throw "lm13: ensure_document_fts missing in $($rc.FullName)" }
+            if (([regex]::Matches($rt, [regex]::Escape("ensure_document_fts"))).Count -lt 2) {
+              throw "lm13: ensure_document_fts defined but never called in $($rc.FullName)"
+            }
+          }
+          Write-Host "lm13 fts self-heal probes OK"
           # 补丁13 探针: 产物 bundle 里第三方默认端点必须绝迹, 我方代理必须在场
           $bundleBlobs = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { ($_.Name -like "*.bundle.js" -or $_.Name -eq "app.asar") -and $_.FullName -notmatch "node_modules" }
