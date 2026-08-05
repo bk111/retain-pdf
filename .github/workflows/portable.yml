@@ -50,8 +50,11 @@ name: Build Portable (Windows)
         # lm13 起 = AI 问答余额角标(代理结算头经 ai_service 透传为 lm_billing
         #           SSE 事件, 前端 fetch-tee 监听, 见补丁15) + backend 剔除
         #           devtools/tests 不装船(见补丁16) + 带 doc 过滤检索 0 行时
-        #           rust 现场回填 FTS(免重启自愈, 见补丁17)
-        default: "lm13"
+        #           rust 现场回填 FTS(免重启自愈, 见补丁17);
+        # lm14 = 角标 URL 匹配修复(实际路径 /api/v1/ai/ask 不含 lm13 匹配的
+        #        "/v1/ask", 拦截永不命中 -> 角标不亮; 装机探针只证代码在船,
+        #        证不了行为 —— 教训)
+        default: "lm14"
   # 2026-07-31 决策: 仅手动触发 (人工把关升级, 防上游坏版本自动下发);
   # 需要自动追新时再恢复 schedule cron
 
@@ -733,7 +736,9 @@ jobs:
               var url = "";
               try { url = typeof input === "string" ? input : ((input && input.url) || ""); } catch (e) { url = ""; }
               var pending = origFetch.apply(this, arguments);
-              if (url.indexOf("/v1/ask") === -1) { return pending; }
+              // 前端实际路径是 /api/v1/ai/ask (rust 反代), 不含 "/v1/ask" ——
+              // lm13 实测角标不亮的根因; 两种形态都认(直连 ai_service 兼容)。
+              if (url.indexOf("ai/ask") === -1 && url.indexOf("/v1/ask") === -1) { return pending; }
               return pending.then(function (resp) {
                 try {
                   if (!resp || !resp.body || typeof resp.body.tee !== "function") { return resp; }
